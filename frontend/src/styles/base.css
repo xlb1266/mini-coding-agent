@@ -1,0 +1,186 @@
+/* 全局基础样式：布局、排版与通用卡片。
+   颜色与字体变量集中在 variables.css，页面与组件只允许使用这些变量。 */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-deep);
+  /* 整页不滚动，滚动只发生在右侧内容区 */
+  overflow: hidden;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+/* ---- 应用骨架 ---- */
+
+.app-shell {
+  display: flex;
+  height: 100%;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  width: 188px;
+  padding: 14px 10px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-deep);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 2px 8px 16px;
+}
+
+.brand-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--text-inverse);
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.nav-item.router-link-active {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.nav-icon {
+  display: flex;
+  flex: none;
+}
+
+.nav-icon svg {
+  display: block;
+}
+
+.app-main {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  background: var(--bg-base);
+}
+
+.page {
+  max-width: 1080px;
+  padding: 22px 26px 40px;
+}
+
+/* 需要占满内容区高度的页面（聊天页）：放开宽度并改为纵向弹性布局 */
+.page-fill {
+  max-width: none;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 22px;
+}
+
+/* ---- 通用页面元素 ---- */
+
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 14px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--text-inverse);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+/* ---- 窄屏（<900px）：侧边栏收起为 56px 图标栏 ---- */
+
+@media (max-width: 899px) {
+  .sidebar {
+    width: 56px;
+    padding: 14px 8px;
+  }
+
+  .brand {
+    justify-content: center;
+    padding: 2px 0 14px;
+  }
+
+  .brand-name,
+  .nav-label {
+    display: none;
+  }
+
+  .nav-item {
+    justify-content: center;
+    padding: 0;
+  }
+}

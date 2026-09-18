@@ -1,0 +1,31 @@
+:root {
+  --bg-deep: #f7f3ec;
+  --bg-base: #faf7f1;
+  --bg-surface: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-hover: #f0ebe2;
+  --bg-active: #e8e1d6;
+
+  --border: #e4ddd3;
+  --border-hover: #d4cbc0;
+  --border-strong: #cdc3b6;
+
+  --accent: #c2703a;
+  --accent-hover: #a85f30;
+  --accent-dim: rgba(194, 112, 58, 0.08);
+
+  --text-primary: #2d2017;
+  --text-secondary: #7a6b5d;
+  --text-tertiary: #a89882;
+  --text-inverse: #ffffff;
+
+  --success: #27896a;
+  --warning: #b8860b;
+  --danger: #c0392b;
+}
+
+:root {
+  --font-body: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Outfit', 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'Fira Code', 'SF Mono', Monaco, Menlo, Consolas, monospace;
+}

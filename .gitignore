@@ -1,0 +1,28 @@
+# 前端
+node_modules/
+dist/
+*.local
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# 数据库（本地开发数据不入库到版本控制）
+backend/*.db
+backend/*.sqlite3
+
+# Skill 文件目录（用户本地数据）
+workspace/
+
+# 本地密钥主密钥文件（模型 API Key 加密用）
+backend/secret.key
+
+# 环境变量与编辑器
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store

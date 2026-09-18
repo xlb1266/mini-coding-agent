@@ -1,0 +1,25 @@
+[project]
+name = "mini-agent-backend"
+version = "0.1.0"
+description = "mini-agent 后端服务（FastAPI + SQLAlchemy + Alembic + SQLite）"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.19.2",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "python-multipart>=0.0.32",
+    "sqlalchemy>=2.0.52",
+    "tzdata>=2026.3",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
