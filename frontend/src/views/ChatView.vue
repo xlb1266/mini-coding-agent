@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 
 import PageHeader from '../components/PageHeader.vue'
 import CompactionCard from '../components/CompactionCard.vue'
+import MarkdownContent from '../components/MarkdownContent.vue'
 import ToolCallCard from '../components/ToolCallCard.vue'
 import { useAgentsStore } from '../stores/agents'
 import { segmentsText, useChatStore } from '../stores/chat'
@@ -333,11 +334,12 @@ function formatSessionTime(iso: string): string {
                 <!-- 带时间线的回复：正文、工具卡片与压缩卡片按事件顺序交错展示 -->
                 <template v-if="message.role === 'assistant' && timelineFor(message)">
                   <template v-for="(segment, index) in timelineFor(message)" :key="index">
-                    <div v-if="segment.kind === 'text'" class="bubble-content">{{ segment.text }}</div>
+                    <MarkdownContent v-if="segment.kind === 'text'" :text="segment.text" />
                     <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
                     <CompactionCard v-else :compact="segment.compact" />
                   </template>
                 </template>
+                <MarkdownContent v-else-if="message.role === 'assistant'" :text="message.content" />
                 <div v-else class="bubble-content">{{ message.content }}</div>
                 <div class="bubble-time">{{ formatMessageTime(message.createdAt) }}</div>
               </div>
@@ -364,12 +366,11 @@ function formatSessionTime(iso: string): string {
                   <span class="bubble-agent">{{ generation.agentName }}</span>
                 </div>
                 <template v-for="(segment, index) in generation.segments" :key="index">
-                  <div v-if="segment.kind === 'text'" class="bubble-content">
-                    {{ segment.text }}<span
-                      v-if="generation.phase === 'generating' && index === generation.segments.length - 1"
-                      class="stream-cursor"
-                    />
-                  </div>
+                  <MarkdownContent
+                    v-if="segment.kind === 'text'"
+                    :text="segment.text"
+                    :cursor="generation.phase === 'generating' && index === generation.segments.length - 1"
+                  />
                   <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
                   <CompactionCard v-else :compact="segment.compact" />
                 </template>
@@ -747,22 +748,6 @@ function formatSessionTime(iso: string): string {
 
   50% {
     opacity: 1;
-  }
-}
-
-.stream-cursor {
-  display: inline-block;
-  width: 7px;
-  height: 13px;
-  margin-left: 2px;
-  vertical-align: -2px;
-  background: var(--accent);
-  animation: blink 1s step-end infinite;
-}
-
-@keyframes blink {
-  50% {
-    opacity: 0;
   }
 }
 
