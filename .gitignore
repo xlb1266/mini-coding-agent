@@ -26,3 +26,6 @@ backend/secret.key
 .idea/
 .vscode/
 .DS_Store
+
+# ZCode 工具目录（会话计划、工作流草稿等，非项目代码）
+.zcode/
