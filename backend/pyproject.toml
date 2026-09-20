@@ -1,7 +1,7 @@
 [project]
-name = "mini-agent-backend"
+name = "mini-coding-agent-backend"
 version = "0.1.0"
-description = "mini-agent 后端服务（FastAPI + SQLAlchemy + Alembic + SQLite）"
+description = "mini-coding-agent 后端服务（FastAPI + SQLAlchemy + Alembic + SQLite）"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.19.2",

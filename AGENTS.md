@@ -1,10 +1,10 @@
-# mini-agent 开发约定
+# mini-coding-agent 开发约定
 
-本文件是 mini-agent 项目的长期开发约定。每次开发会话先阅读本文件；约定变化时只更新这一个文件，不要把规则重复写进各次任务说明。
+本文件是 mini-coding-agent 项目的长期开发约定。每次开发会话先阅读本文件；约定变化时只更新这一个文件，不要把规则重复写进各次任务说明。
 
 ## 项目简介
 
-mini-agent 是一个本地优先的 Agent 工作台，包含聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测八个模块。项目按阶段逐步实现，各阶段进度与实现说明见 docs/ 下的阶段文档；Agent Loop 统一由 `app/services/agent_runtime.py` 的 AgentRuntime 执行（聊天与后续评测共用），上下文容量管理与自动压缩也在统一 Runtime 内实现（摘要与边界保存在会话上，聊天记录不被删除或改写），本地工具执行一律走统一入口 `app/services/tools/executor.py`；运行记录与可观察性由 `app/services/run_recorder.py` 落库（一次发送消息对应一条 Run，事件复用 Runtime 真实输出，`/api/runs` 提供列表、详情时间线与详细载荷读取）。
+mini-coding-agent 是一个本地优先的 coding agent 工作台，由 mini-agent 底座（`main` 的 `869fd50`）派生而来的独立项目，包含聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测八个模块，后续在此基础上特化 coding agent 能力。项目按阶段逐步实现，各阶段进度与实现说明见 docs/ 下的阶段文档；Agent Loop 统一由 `app/services/agent_runtime.py` 的 AgentRuntime 执行（聊天与后续评测共用），上下文容量管理与自动压缩也在统一 Runtime 内实现（摘要与边界保存在会话上，聊天记录不被删除或改写），本地工具执行一律走统一入口 `app/services/tools/executor.py`；运行记录与可观察性由 `app/services/run_recorder.py` 落库（一次发送消息对应一条 Run，事件复用 Runtime 真实输出，`/api/runs` 提供列表、详情时间线与详细载荷读取）。
 
 ## 固定技术栈
 

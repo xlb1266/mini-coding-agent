@@ -1,6 +1,6 @@
-# mini-agent
+# mini-coding-agent
 
-本地优先的 Agent 工作台。包含聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测八个模块。
+本地优先的 coding agent 工作台，由 mini-agent 底座（`main` 的 `869fd50`）派生的独立项目。当前继承底座的八个模块：聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测，后续在此基础上特化 coding agent 能力。
 
 当前进度：阶段一（系统初始化）、阶段二（模型管理）、阶段三（工具管理）、阶段四（Skills 管理）、阶段五（MCP 管理）、阶段六（Agent 管理）、阶段七（聊天页面）、阶段八（统一 Agent Runtime）、阶段九（工具执行过程展示）、阶段十（上下文容量管理与自动压缩）、阶段十一（运行记录与可观察性）与阶段十二（Agent 评测）已完成。详见 [docs/phase-1.md](docs/phase-1.md) 至 [docs/phase-12.md](docs/phase-12.md)。
 

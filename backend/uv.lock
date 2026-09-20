@@ -312,7 +312,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mini-agent-backend"
+name = "mini-coding-agent-backend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
