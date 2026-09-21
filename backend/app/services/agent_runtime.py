@@ -109,7 +109,7 @@ from app.services.token_estimation import (
     estimate_messages_tokens,
     estimate_tokens,
 )
-from app.services.tools.base import ToolExecutionResult
+from app.services.tools.base import ToolContext, ToolExecutionResult
 from app.services.tools.executor import execute_tool
 from app.services.tools.registry import get_definition
 
@@ -365,6 +365,9 @@ class _LoadedConfig:
     mcp_servers: list[_McpServerConfig]
     compaction: CompactionSettings
     capacity: Capacity
+    # 运行级工具上下文：Agent 配置了工作区目录时构造，未配置为 None
+    #（执行入口与 handler 回落到全局默认目录）
+    tool_context: ToolContext | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +445,23 @@ def _builtin_summary(key: str, data: dict[str, Any]) -> str:
         detail = f"{data.get('action')} {data.get('path', '')}"
         if data.get("action") == "write":
             detail += f"（{data.get('outcome')}，{data.get('sizeBytes')} 字节）"
+        return detail
+    if key == "builtin_edit_file":
+        return f"编辑 {data.get('path', '')}，替换 {data.get('replacements', 0)} 处"
+    if key == "builtin_list_dir":
+        detail = f"列出 {data.get('path', '')}，共 {data.get('totalEntries', 0)} 个条目"
+        if data.get("recursive"):
+            detail += "（递归）"
+        if data.get("truncated"):
+            detail += "，已截断"
+        return detail
+    if key == "builtin_grep":
+        detail = f"搜索「{data.get('pattern', '')}」，命中 {data.get('totalMatches', 0)} 处"
+        files = data.get("filesSearched")
+        if isinstance(files, int):
+            detail += f"（扫描 {files} 个文件）"
+        if data.get("truncated"):
+            detail += "，已截断"
         return detail
     return json.dumps(data, ensure_ascii=False)
 
@@ -885,6 +905,10 @@ class AgentRuntime:
                 keep_rounds=agent.compact_keep_rounds,
                 summary_target_tokens=agent.compact_summary_tokens,
             )
+            # Agent 配置了工作区目录时构造运行级 ToolContext：文件沙箱根与
+            # Shell 工作目录跟随 Agent 工作区；未配置为 None，回落全局默认目录
+            workspace_dir = (agent.workspace_dir or "").strip()
+            tool_context = ToolContext(workspace_root=Path(workspace_dir)) if workspace_dir else None
             return _LoadedConfig(
                 agent_id=agent.id,
                 agent_name=agent.name,
@@ -901,6 +925,7 @@ class AgentRuntime:
                 mcp_servers=mcp_servers,
                 compaction=compaction,
                 capacity=compute_capacity(compaction, model.context_length, model.max_output_tokens),
+                tool_context=tool_context,
             )
         finally:
             db.close()
@@ -1812,7 +1837,7 @@ class AgentRuntime:
         """
         assert state.config is not None
         result, denial = await asyncio.to_thread(
-            self._builtin_sync, state.config.agent_id, entry, arguments
+            self._builtin_sync, state.config.agent_id, entry, arguments, state.config.tool_context
         )
         if denial is not None:
             state.rejected_tool_calls += 1
@@ -1846,7 +1871,11 @@ class AgentRuntime:
         )
 
     def _builtin_sync(
-        self, agent_id: int, entry: _ToolEntry, arguments: dict[str, Any]
+        self,
+        agent_id: int,
+        entry: _ToolEntry,
+        arguments: dict[str, Any],
+        context: ToolContext | None = None,
     ) -> tuple[ToolExecutionResult | None, str | None]:
         """权限复检 + 执行（在线程中运行）。返回 (结果, None) 或 (None, 拒绝原因)。"""
         db = self._session_factory()
@@ -1869,7 +1898,7 @@ class AgentRuntime:
             return None, "工具不存在或已被删除"
         if not row.enabled:
             return None, f"工具「{row.name}」已停用，拒绝执行"
-        return execute_tool(row, arguments), None
+        return execute_tool(row, arguments, context), None
 
     async def _run_mcp(
         self, state: _RunState, config: _LoadedConfig, entry: _ToolEntry, arguments: dict[str, Any]

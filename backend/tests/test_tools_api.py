@@ -20,9 +20,19 @@ class TestList:
             "builtin_current_time",
             "builtin_shell",
             "builtin_file",
+            "builtin_edit_file",
+            "builtin_list_dir",
+            "builtin_grep",
         ]
         assert all(tool["isBuiltin"] and tool["enabled"] for tool in listing)
-        assert [tool["name"] for tool in listing] == ["当前时间", "Shell 命令执行", "文件读写"]
+        assert [tool["name"] for tool in listing] == [
+            "当前时间",
+            "Shell 命令执行",
+            "文件读写",
+            "文件编辑",
+            "目录列表",
+            "内容搜索",
+        ]
 
     def test_list_without_seed_is_empty(self, client: TestClient) -> None:
         assert client.get("/api/tools").json() == []

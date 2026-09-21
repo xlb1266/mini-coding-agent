@@ -25,6 +25,8 @@ function makeAgent(overrides: Partial<AgentItem> = {}): AgentItem {
     model: { id: 1, displayName: 'DeepSeek-V3', modelIdentifier: 'deepseek-chat' },
     promptVersion: 2,
     maxRounds: 25,
+    workspaceDir: '',
+    requireApproval: false,
     autoCompact: true,
     compactThreshold: 80,
     compactKeepRounds: 4,

@@ -16,6 +16,7 @@ from app.services.tools.base import (
     ERROR_INVALID_PARAMS,
     ERROR_TIMEOUT,
     ToolBlockedError,
+    ToolContext,
     ToolExecutionError,
     ToolExecutionResult,
     ToolParamError,
@@ -28,8 +29,16 @@ from app.services.tools.registry import get_definition
 _TYPE_LABELS = {"string": "字符串", "integer": "整数", "boolean": "布尔值（true/false）"}
 
 
-def execute_tool(tool: Tool, params: Mapping[str, object]) -> ToolExecutionResult:
-    """执行一个工具并返回统一结果。参数 params 的取值来自 JSON 请求体。"""
+def execute_tool(
+    tool: Tool,
+    params: Mapping[str, object],
+    context: ToolContext | None = None,
+) -> ToolExecutionResult:
+    """执行一个工具并返回统一结果。参数 params 的取值来自 JSON 请求体。
+
+    context 携带运行级工作区（Agent 工作区或全局默认目录）；None 时
+    handler 内部回落 settings 的默认目录。
+    """
     if not tool.enabled:
         return ToolExecutionResult.failure(
             ERROR_DISABLED,
@@ -50,7 +59,7 @@ def execute_tool(tool: Tool, params: Mapping[str, object]) -> ToolExecutionResul
         return ToolExecutionResult.failure(ERROR_INVALID_PARAMS, error.message, error.hint, error.fields)
 
     try:
-        data = definition.handler(validated)
+        data = definition.handler(validated, context)
     except ToolParamError as error:
         return ToolExecutionResult.failure(ERROR_INVALID_PARAMS, error.message, error.hint, error.fields)
     except ToolBlockedError as error:

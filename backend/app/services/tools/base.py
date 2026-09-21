@@ -5,6 +5,18 @@
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    """一次工具执行的运行环境；由调用方构造（Runtime 按 Agent 工作区，
+    手动测试端点用全局默认目录），handler 里 None 时回落 settings。
+
+    workspace_root 决定文件类工具的沙箱根与 Shell 命令的工作目录。
+    """
+
+    workspace_root: Path
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,12 @@ export const MAX_ROUNDS_MIN = 1
 export const MAX_ROUNDS_MAX = 100
 export const DEFAULT_MAX_ROUNDS = 25
 
+/** 工作区目录长度上限（与后端数据库列宽一致）。 */
+export const WORKSPACE_DIR_MAX_LENGTH = 512
+
+/** 绝对路径：Windows 盘符（D:\dir 或 D:/dir）或 Unix 根路径（/dir）。 */
+const ABSOLUTE_PATH_RE = /^(?:[a-zA-Z]:[\\/].*|\/.*)$/
+
 /** 上下文压缩配置范围与默认值（与后端 app/schemas/agent.py 一致）。 */
 export const COMPACT_THRESHOLD_MIN = 10
 export const COMPACT_THRESHOLD_MAX = 95
@@ -31,6 +37,8 @@ export interface AgentFormValues {
   systemPrompt: string
   modelId: string
   maxRounds: string
+  workspaceDir: string
+  requireApproval: boolean
   autoCompact: boolean
   compactThreshold: string
   compactKeepRounds: string
@@ -49,6 +57,8 @@ export function emptyFormValues(): AgentFormValues {
     systemPrompt: '',
     modelId: '',
     maxRounds: String(DEFAULT_MAX_ROUNDS),
+    workspaceDir: '',
+    requireApproval: false,
     autoCompact: true,
     compactThreshold: String(DEFAULT_COMPACT_THRESHOLD),
     compactKeepRounds: String(DEFAULT_COMPACT_KEEP_ROUNDS),
@@ -99,6 +109,15 @@ export function validateAgentForm(values: AgentFormValues): AgentFormErrors {
     errors.maxRounds = `最大执行轮数必须为 ${MAX_ROUNDS_MIN}–${MAX_ROUNDS_MAX} 的正整数`
   }
 
+  // 工作区目录：留空合法（用全局默认目录）；填写必须是绝对路径
+  // （目录是否真实存在由后端校验，前端只查格式）
+  const workspaceDir = values.workspaceDir.trim()
+  if (workspaceDir.length > WORKSPACE_DIR_MAX_LENGTH) {
+    errors.workspaceDir = `工作区目录不能超过 ${WORKSPACE_DIR_MAX_LENGTH} 个字符`
+  } else if (workspaceDir !== '' && !ABSOLUTE_PATH_RE.test(workspaceDir)) {
+    errors.workspaceDir = '工作区目录必须是绝对路径（例如 D:\\projects\\demo），或留空使用默认目录'
+  }
+
   // 上下文压缩配置：即使关闭自动压缩也保持合法值，便于随时重新开启
   const threshold = Number(normalizeNumeric(values.compactThreshold.trim()))
   if (
@@ -141,6 +160,8 @@ export function buildAgentPayload(values: AgentFormValues): AgentPayload {
     systemPrompt: values.systemPrompt,
     modelId: Number(values.modelId),
     maxRounds: Number(normalizeNumeric(values.maxRounds.trim())),
+    workspaceDir: values.workspaceDir.trim(),
+    requireApproval: values.requireApproval,
     autoCompact: values.autoCompact,
     compactThreshold: Number(normalizeNumeric(values.compactThreshold.trim())),
     compactKeepRounds: Number(normalizeNumeric(values.compactKeepRounds.trim())),

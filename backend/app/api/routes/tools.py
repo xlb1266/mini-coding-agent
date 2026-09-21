@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models.tool import Tool
 from app.db.session import get_db
 from app.schemas.tool import (
@@ -23,6 +24,7 @@ from app.schemas.tool import (
     ToolParamOut,
     ToolUpdateRequest,
 )
+from app.services.tools.base import ToolContext
 from app.services.tools.executor import execute_tool
 
 router = APIRouter(prefix="/tools", tags=["tools"])
@@ -141,7 +143,8 @@ def execute_tool_endpoint(
 ) -> ToolExecuteOut:
     """统一执行入口：存在性检查 → 启停检查 → 参数校验 → 执行 → 统一结果。"""
     tool = _get_or_404(db, tool_id)
-    result = execute_tool(tool, payload.params)
+    # 手动测试端点没有 Agent 上下文，用全局默认工作区构造 ToolContext
+    result = execute_tool(tool, payload.params, ToolContext(workspace_root=settings.tool_workspace_dir))
 
     if result.ok:
         return ToolExecuteOut(ok=True, result=result.data)

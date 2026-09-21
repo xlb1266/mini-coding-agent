@@ -452,3 +452,62 @@ class TestCompactionConfig:
         assert detail["compactThreshold"] == 60
         assert detail["compactKeepRounds"] == 2
         assert detail["compactSummaryTokens"] == 600
+
+
+class TestWorkspaceDir:
+    def test_empty_workspace_dir_is_legal(self, client: TestClient, seeded_tools: None) -> None:
+        model = create_model(client)
+        body = create_agent(client, model["id"])
+
+        assert body["workspaceDir"] == ""
+        assert body["requireApproval"] is False
+
+    def test_valid_absolute_dir_saved(self, client: TestClient, seeded_tools: None, tmp_path: Path) -> None:
+        ws = tmp_path / "agent-ws"
+        ws.mkdir()
+        model = create_model(client)
+
+        body = create_agent(client, model["id"], workspaceDir=str(ws))
+
+        assert body["workspaceDir"] == str(ws)
+
+    def test_relative_path_rejected(self, client: TestClient, seeded_tools: None) -> None:
+        model = create_model(client)
+
+        response = client.post("/api/agents", json=agent_payload(model["id"], workspaceDir="relative/dir"))
+
+        assert response.status_code == 422
+        assert "workspaceDir" in response.json()["detail"]["fields"]
+
+    def test_missing_dir_rejected(self, client: TestClient, seeded_tools: None, tmp_path: Path) -> None:
+        model = create_model(client)
+        missing = tmp_path / "not-created"
+
+        response = client.post("/api/agents", json=agent_payload(model["id"], workspaceDir=str(missing)))
+
+        assert response.status_code == 422
+        assert "workspaceDir" in response.json()["detail"]["fields"]
+
+    def test_file_path_rejected(self, client: TestClient, seeded_tools: None, tmp_path: Path) -> None:
+        model = create_model(client)
+        not_a_dir = tmp_path / "file.txt"
+        not_a_dir.write_text("x", encoding="utf-8")
+
+        response = client.post("/api/agents", json=agent_payload(model["id"], workspaceDir=str(not_a_dir)))
+
+        assert response.status_code == 422
+        assert "workspaceDir" in response.json()["detail"]["fields"]
+
+    def test_update_roundtrip(self, client: TestClient, seeded_tools: None, tmp_path: Path) -> None:
+        ws = tmp_path / "agent-ws"
+        ws.mkdir()
+        model = create_model(client)
+        agent = create_agent(client, model["id"], workspaceDir=str(ws))
+
+        response = client.put(
+            f"/api/agents/{agent['id']}",
+            json=agent_payload(model["id"], workspaceDir=""),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["workspaceDir"] == ""

@@ -42,6 +42,14 @@ def column_names(db_path: Path, table: str) -> list[str]:
     return sorted(row[1] for row in rows)
 
 
+def seed_tool_keys(db_path: Path) -> list[str]:
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT key FROM tools").fetchall()
+    return sorted(row[0] for row in rows)
+
+
 def test_migration_upgrade_downgrade_roundtrip(tmp_path: Path) -> None:
     db_path = tmp_path / "migration-test.db"
     db_url = f"sqlite:///{db_path.as_posix()}"
@@ -60,6 +68,16 @@ def test_migration_upgrade_downgrade_roundtrip(tmp_path: Path) -> None:
         column_names(db_path, "agents")
     )
     assert {"summary_text", "summary_boundary_seq"} <= set(column_names(db_path, "chat_sessions"))
+    # 模块一：Agent 工作区目录与审批开关；三个内置编码工具种子
+    assert {"workspace_dir", "require_approval"} <= set(column_names(db_path, "agents"))
+    assert set(seed_tool_keys(db_path)) >= {
+        "builtin_current_time",
+        "builtin_shell",
+        "builtin_file",
+        "builtin_edit_file",
+        "builtin_list_dir",
+        "builtin_grep",
+    }
 
     run_alembic(db_url, "downgrade", "base")
     assert "model_configs" not in table_names(db_path)

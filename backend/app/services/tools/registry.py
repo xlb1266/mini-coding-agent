@@ -3,6 +3,10 @@
 迁移 0003 从 builtin_tool_rows() 读取定义写入 tools 表，
 统一执行入口按 key 绑定 handler。新增内置工具时：在这里加定义，
 再新增一个迁移把对应行插入 tools 表。
+
+handler 统一签名 (params, context)：context 是运行级 ToolContext
+（决定文件沙箱根与 Shell 工作目录），调用方未提供时传 None，
+handler 内部回落全局默认目录。
 """
 
 import json
@@ -10,8 +14,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
-from app.services.tools.base import ToolParamSpec
-from app.services.tools.handlers import run_current_time, run_file, run_shell
+from app.services.tools.base import ToolContext, ToolParamSpec
+from app.services.tools.handlers import (
+    run_current_time,
+    run_edit_file,
+    run_file,
+    run_grep,
+    run_list_dir,
+    run_shell,
+)
 
 
 @dataclass(frozen=True)
@@ -22,7 +33,7 @@ class ToolDefinition:
     name: str
     description: str
     params: list[ToolParamSpec]
-    handler: Callable[[dict], dict]
+    handler: Callable[[dict, ToolContext | None], dict]
 
 
 BUILTIN_TOOLS: list[ToolDefinition] = [
@@ -126,6 +137,130 @@ BUILTIN_TOOLS: list[ToolDefinition] = [
             ),
         ],
         handler=run_file,
+    ),
+    ToolDefinition(
+        key="builtin_edit_file",
+        name="文件编辑",
+        description=(
+            "对授权工作区内已有的文本文件做精确字符串替换，返回统一 diff 与替换次数。"
+            "适用场景：修改代码中的一处逻辑、调整配置项、重命名标识符等需要保留"
+            "文件其余内容不动的小步编辑。输入要求：path 为相对工作区根目录的路径"
+            "或工作区内的绝对路径；old_string 必须与文件中的原文完全一致（包括空格、"
+            "缩进与换行），new_string 为替换后的内容（传空串即删除该段）；replace_all"
+            " 默认 false，为 true 时替换全部出现位置。使用限制：old_string 在文件中"
+            "出现 0 次会报「未找到」，出现多处且未开 replace_all 会报错提示提供更长"
+            "上下文；单次编辑的文件与替换后内容均不超过 512KB；编辑会产生 diff 输出，"
+            "超长会截断。"
+        ),
+        params=[
+            ToolParamSpec(
+                name="path",
+                type="string",
+                required=True,
+                description="相对授权工作区根目录的路径，或工作区内的绝对路径",
+                example="src/main.py",
+            ),
+            ToolParamSpec(
+                name="old_string",
+                type="string",
+                required=True,
+                description="要替换的原内容，必须与文件原文完全一致（含空格与换行）",
+            ),
+            ToolParamSpec(
+                name="new_string",
+                type="string",
+                required=True,
+                description="替换后的内容，传空串表示删除 old_string",
+            ),
+            ToolParamSpec(
+                name="replace_all",
+                type="boolean",
+                required=False,
+                description="是否替换全部出现位置；默认 false（出现多处时会报错）",
+                example="false",
+            ),
+        ],
+        handler=run_edit_file,
+    ),
+    ToolDefinition(
+        key="builtin_list_dir",
+        name="目录列表",
+        description=(
+            "列出授权工作区内一个目录的内容，返回条目的相对路径、类型与大小。"
+            "适用场景：浏览项目结构、查找文件位置、确认操作前的目录状态。"
+            "输入要求：path 为相对工作区根目录的子目录路径，留空时列出工作区根目录；"
+            "recursive 为可选开关，开启后递归列出子目录。使用限制：recursive 最多"
+            "下探 3 层、最多返回 500 个条目，超限时截断并标记 truncated；目录条目的"
+            "大小记为 0；列表顺序为目录在前、同类按名称排序。"
+        ),
+        params=[
+            ToolParamSpec(
+                name="path",
+                type="string",
+                required=False,
+                description="要列出的子目录，留空时列出工作区根目录",
+                example="src",
+            ),
+            ToolParamSpec(
+                name="recursive",
+                type="boolean",
+                required=False,
+                description="是否递归列出子目录（深度最多 3 层，条目最多 500 个）",
+                example="true",
+            ),
+        ],
+        handler=run_list_dir,
+    ),
+    ToolDefinition(
+        key="builtin_grep",
+        name="内容搜索",
+        description=(
+            "在授权工作区的文件内容中按正则表达式递归搜索，返回匹配的文件、行号与"
+            "该行内容。适用场景：查找函数定义、追踪变量引用、定位报错关键字等。"
+            "输入要求：pattern 为合法的正则表达式；path 为可选的子目录（留空搜整个"
+            "工作区）；glob 为可选的文件名过滤（如 *.py）；case_insensitive 开启后"
+            "忽略大小写。使用限制：max_results 为返回条数上限（1–200，默认 50），"
+            "超过上限时截断并标记 truncated；二进制文件、超过 512KB 的文件会被跳过；"
+            "只搜索文本内容，不理解代码语义。"
+        ),
+        params=[
+            ToolParamSpec(
+                name="pattern",
+                type="string",
+                required=True,
+                description="要搜索的正则表达式，例如 def\\s+\\w+\\(",
+                example="TODO",
+            ),
+            ToolParamSpec(
+                name="path",
+                type="string",
+                required=False,
+                description="要搜索的子目录，留空时搜索整个工作区",
+                example="src",
+            ),
+            ToolParamSpec(
+                name="glob",
+                type="string",
+                required=False,
+                description="文件名过滤，支持通配符，例如 *.py",
+                example="*.py",
+            ),
+            ToolParamSpec(
+                name="case_insensitive",
+                type="boolean",
+                required=False,
+                description="是否忽略大小写，默认 false",
+                example="true",
+            ),
+            ToolParamSpec(
+                name="max_results",
+                type="integer",
+                required=False,
+                description="返回条数上限，1–200，默认 50",
+                example="50",
+            ),
+        ],
+        handler=run_grep,
     ),
 ]
 

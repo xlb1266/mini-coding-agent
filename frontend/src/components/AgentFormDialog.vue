@@ -130,6 +130,8 @@ async function fillFromDetail(id: number): Promise<void> {
     values.systemPrompt = detail.systemPrompt
     values.modelId = detail.model === null ? '' : String(detail.model.id)
     values.maxRounds = String(detail.maxRounds)
+    values.workspaceDir = detail.workspaceDir
+    values.requireApproval = detail.requireApproval
     values.autoCompact = detail.autoCompact
     values.compactThreshold = String(detail.compactThreshold)
     values.compactKeepRounds = String(detail.compactKeepRounds)
@@ -239,6 +241,20 @@ function bindingBadge(binding: AgentBindingRef): string {
           <p class="field-hint">限制 Agent Loop 的执行轮数，范围 {{ MAX_ROUNDS_MIN }}–{{ MAX_ROUNDS_MAX }}，默认 25。</p>
           <p v-if="errors.maxRounds" class="field-error">{{ errors.maxRounds }}</p>
         </div>
+      </div>
+
+      <div class="form-field">
+        <label>工作区目录</label>
+        <input
+          v-model="values.workspaceDir"
+          type="text"
+          placeholder="例如 D:\projects\demo（留空使用默认目录）"
+        />
+        <p class="field-hint">
+          Agent 运行时文件工具（读写 / 编辑 / 列目录 / 搜索）的授权范围，以及 Shell 命令的执行目录。
+          必须是本机已存在的绝对路径目录，不会被自动创建；留空时使用系统默认工作区。
+        </p>
+        <p v-if="errors.workspaceDir" class="field-error">{{ errors.workspaceDir }}</p>
       </div>
 
       <div class="form-field compact-section">

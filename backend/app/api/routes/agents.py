@@ -14,6 +14,7 @@
 """
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, selectinload
@@ -118,6 +119,8 @@ def _to_out(agent: Agent) -> AgentOut:
         model=_model_out(agent.model),
         prompt_version=agent.prompt_version,
         max_rounds=agent.max_rounds,
+        workspace_dir=agent.workspace_dir,
+        require_approval=agent.require_approval,
         auto_compact=agent.auto_compact,
         compact_threshold=agent.compact_threshold,
         compact_keep_rounds=agent.compact_keep_rounds,
@@ -229,6 +232,13 @@ def _validate_payload(
     if db.get(ModelConfig, payload.model_id) is None:
         errors["modelId"] = "所选模型不存在或已被删除"
 
+    # 工作区目录：留空合法（用全局默认目录）；填写必须是已存在的绝对路径目录，
+    # 不自动创建，避免拼错路径后工具悄悄落到别处
+    workspace_dir = payload.workspace_dir.strip()
+    if workspace_dir:
+        if not Path(workspace_dir).is_absolute() or not Path(workspace_dir).is_dir():
+            errors["workspaceDir"] = "工作区目录必须是已存在的绝对路径目录，或留空使用默认目录"
+
     existing: set[tuple[str, str]] = set()
     if agent_id is not None:
         agent = db.get(Agent, agent_id)
@@ -291,6 +301,8 @@ def create_agent(payload: AgentCreateRequest, db: Session = Depends(get_db)) -> 
         prompt_version=1,
         model_id=payload.model_id,
         max_rounds=payload.max_rounds,
+        workspace_dir=payload.workspace_dir.strip(),
+        require_approval=payload.require_approval,
         auto_compact=payload.auto_compact,
         compact_threshold=payload.compact_threshold,
         compact_keep_rounds=payload.compact_keep_rounds,
@@ -330,6 +342,8 @@ def update_agent(
     agent.description = payload.description.strip()
     agent.model_id = payload.model_id
     agent.max_rounds = payload.max_rounds
+    agent.workspace_dir = payload.workspace_dir.strip()
+    agent.require_approval = payload.require_approval
     agent.auto_compact = payload.auto_compact
     agent.compact_threshold = payload.compact_threshold
     agent.compact_keep_rounds = payload.compact_keep_rounds

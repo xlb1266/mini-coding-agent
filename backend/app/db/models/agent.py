@@ -49,6 +49,12 @@ class Agent(Base):
     )
     # Agent Loop 的最大执行轮数
     max_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
+    # ---- 工作区与审批（模块一）----
+    # 工作区目录：空串 = 使用全局默认目录（settings.tool_workspace_dir）；
+    # 填写时必须是已存在的绝对路径目录（保存时校验，不自动创建）。
+    workspace_dir: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    # 工具调用是否需要人工审批；本列模块一仅落库，审批逻辑在模块二实现
+    require_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # ---- 上下文压缩配置（默认开启；关闭后不生成摘要，超容量直接提示） ----
     auto_compact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # 触发比例：估算输入达到可用输入容量的百分之多少时触发（10–95）

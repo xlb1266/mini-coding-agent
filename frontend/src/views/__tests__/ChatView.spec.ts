@@ -45,6 +45,8 @@ function makeAgent(): AgentItem {
     model: { id: 1, displayName: 'DeepSeek-V3', modelIdentifier: 'deepseek-chat' },
     promptVersion: 1,
     maxRounds: 25,
+    workspaceDir: '',
+    requireApproval: false,
     autoCompact: true,
     compactThreshold: 80,
     compactKeepRounds: 4,

@@ -110,7 +110,7 @@ describe('RunsView 运行列表页', () => {
 
   it('Agent 筛选变化时携带 agentId 重新请求', async () => {
     vi.mocked(listAgents).mockResolvedValue([
-      { id: 1, name: '测试助手', description: '', model: null, promptVersion: 1, maxRounds: 25, autoCompact: true, compactThreshold: 80, compactKeepRounds: 4, compactSummaryTokens: 1000, isDefault: true, toolCount: 0, skillCount: 0, mcpCount: 0, createdAt: '', updatedAt: '' },
+      { id: 1, name: '测试助手', description: '', model: null, promptVersion: 1, maxRounds: 25, workspaceDir: '', requireApproval: false, autoCompact: true, compactThreshold: 80, compactKeepRounds: 4, compactSummaryTokens: 1000, isDefault: true, toolCount: 0, skillCount: 0, mcpCount: 0, createdAt: '', updatedAt: '' },
     ])
     const wrapper = await mountView()
 

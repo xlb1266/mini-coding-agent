@@ -30,6 +30,10 @@ export interface AgentItem {
   model: AgentModelInfo | null
   promptVersion: number
   maxRounds: number
+  /** 工作区目录：空串 = 使用全局默认目录；文件工具沙箱与 Shell 工作目录跟随它 */
+  workspaceDir: string
+  /** 工具调用是否需要人工审批（模块一仅落库，审批逻辑在模块二实现） */
+  requireApproval: boolean
   /** 上下文压缩配置：长会话超过估算容量时自动整理摘要 */
   autoCompact: boolean
   /** 触发比例（百分比整数 10–95）：估算输入达到可用输入容量的该比例时触发 */
@@ -61,6 +65,8 @@ export interface AgentPayload {
   systemPrompt: string
   modelId: number
   maxRounds: number
+  workspaceDir: string
+  requireApproval: boolean
   autoCompact: boolean
   compactThreshold: number
   compactKeepRounds: number
