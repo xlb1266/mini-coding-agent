@@ -11,7 +11,9 @@ defineEmits<{
 </script>
 
 <template>
-  <div v-if="open" class="dialog-overlay" @click.self="$emit('close')">
+  <!-- 遮罩点击不关闭：避免填了一半的表单因误点面板外而整体丢失，
+       关闭只走右上角 × 与面板内的取消/关闭按钮 -->
+  <div v-if="open" class="dialog-overlay">
     <div class="dialog-card card" :style="{ width: `${width ?? 560}px` }" role="dialog" :aria-label="title">
       <div class="dialog-head">
         <h2 class="dialog-title">{{ title }}</h2>
