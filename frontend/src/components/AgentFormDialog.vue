@@ -5,6 +5,7 @@ import { useRouter } from 'vue-router'
 import AppDialog from './AppDialog.vue'
 import { ApiError } from '../api/request'
 import type { AgentBindingRef, AgentDetail, AgentItem } from '../api/agents'
+import { pickDirectory } from '../api/system'
 import { useAgentsStore } from '../stores/agents'
 import { useMcpStore } from '../stores/mcp'
 import { useModelsStore } from '../stores/models'
@@ -50,6 +51,8 @@ const errors = ref<AgentFormErrors>({})
 const formError = ref('')
 const saving = ref(false)
 const loading = ref(false)
+/** 正在等待后端的目录选择窗口（用户挑选期间请求保持挂起）。 */
+const pickingDirectory = ref(false)
 /** 编辑时加载到的完整配置；绑定可用状态以它为准。 */
 const loadedDetail = ref<AgentDetail | null>(null)
 
@@ -151,6 +154,24 @@ function goModels(): void {
   void router.push('/models')
 }
 
+/** 弹出后端在本机打开的原生"选择文件夹"窗口，选中后回填到输入框。 */
+async function chooseWorkspaceDir(): Promise<void> {
+  if (pickingDirectory.value) return
+  pickingDirectory.value = true
+  formError.value = ''
+  try {
+    const result = await pickDirectory()
+    if (result.path) {
+      values.workspaceDir = result.path
+      delete errors.value.workspaceDir
+    }
+  } catch (error) {
+    formError.value = error instanceof Error ? error.message : '打开目录选择窗口失败，请手动输入路径'
+  } finally {
+    pickingDirectory.value = false
+  }
+}
+
 async function submit(): Promise<void> {
   errors.value = validateAgentForm(values)
   if (Object.keys(errors.value).length > 0) return
@@ -245,14 +266,19 @@ function bindingBadge(binding: AgentBindingRef): string {
 
       <div class="form-field">
         <label>工作区目录</label>
-        <input
-          v-model="values.workspaceDir"
-          type="text"
-          placeholder="例如 D:\projects\demo（留空使用默认目录）"
-        />
+        <div class="dir-row">
+          <input
+            v-model="values.workspaceDir"
+            type="text"
+            placeholder="例如 D:\projects\demo（留空使用默认目录）"
+          />
+          <button class="btn-choose" type="button" :disabled="pickingDirectory" @click="chooseWorkspaceDir">
+            {{ pickingDirectory ? '选择窗口已打开…' : '选择目录' }}
+          </button>
+        </div>
         <p class="field-hint">
           Agent 运行时文件工具（读写 / 编辑 / 列目录 / 搜索）的授权范围，以及 Shell 命令的执行目录。
-          必须是本机已存在的绝对路径目录，不会被自动创建；留空时使用系统默认工作区。
+          可点击「选择目录」弹出本机文件夹选择窗口，或直接粘贴本机已存在的绝对路径；不会被自动创建，留空时使用系统默认工作区。
         </p>
         <p v-if="errors.workspaceDir" class="field-error">{{ errors.workspaceDir }}</p>
       </div>
@@ -531,6 +557,41 @@ function bindingBadge(binding: AgentBindingRef): string {
 .form-field select:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+/* 工作区目录行：输入框 + 原生选择窗口按钮 */
+.dir-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dir-row input[type='text'] {
+  flex: 1;
+  min-width: 0;
+}
+
+.btn-choose {
+  flex: none;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-choose:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.btn-choose:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .form-grid {

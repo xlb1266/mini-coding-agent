@@ -35,7 +35,7 @@
 cd backend
 uv sync                                          # 按 uv.lock 安装依赖到 .venv
 uv run alembic upgrade head                      # 建库并应用迁移（生成 backend/mini_agent.db）
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
 命令含义：`uv run` 在项目虚拟环境中执行命令；`uvicorn app.main:app` 指启动 `app/main.py` 里的 FastAPI 实例；`--host 127.0.0.1` 限制只监听本机；`--reload` 让代码修改后自动重启。
@@ -47,7 +47,7 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```bash
 cd frontend
 npm install                                      # 安装依赖
-npm run dev                                      # 启动 Vite 开发服务
+npm run dev -- --port 5174                                 # 启动 Vite 开发服务
 ```
 
 打开 http://localhost:5173 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8000 端口的后端，业务代码不写死后端地址。
