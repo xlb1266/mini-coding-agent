@@ -42,6 +42,10 @@ Runtime 不依赖前端页面、HTTP 请求对象或浏览器连接；取消信�
   参数（脱敏、超长截断）与 MCP Server 名称，结束事件带状态（success /
   error / cancelled，取消时也给在执行的工具一个明确终态）、耗时、脱敏
   摘要与整理后的结果文本（脱敏、截断标注，失败时为可读原因而非堆栈）；
+- approval_request / approval_result：工具执行审批（模块二，仅当调用方
+  提供审批钩子且调用命中审批范围）的请求与决定，用 requestId 标识；
+  请求带整理后的参数，决定为 approved / rejected / timeout / cancelled，
+  超时与用户拒绝同样把拒绝结果回给模型（不进入执行入口）；
 - context_compaction_start / context_compaction_end：自动压缩起止（触发
   原因、压缩前后估算 Token、处理与保留的消息数量、耗时、失败原因）；
 - context_trim：备用裁剪（触发原因、前后估算 Token、裁掉与保留的数量）。
@@ -59,7 +63,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy.orm import sessionmaker
 
@@ -75,6 +79,11 @@ from app.db.models.mcp_server import McpServer
 from app.db.models.model_config import ModelConfig
 from app.db.models.skill import Skill
 from app.db.models.tool import Tool
+from app.services.approvals import (
+    DECISION_APPROVED,
+    DECISION_CANCELLED,
+    DECISION_TIMEOUT,
+)
 from app.services.context_compaction import (
     Capacity,
     CompactionSettings,
@@ -122,6 +131,8 @@ TEXT_DELTA = "text_delta"
 MODEL_REQUEST_END = "model_request_end"
 TOOL_CALL_START = "tool_call_start"
 TOOL_CALL_END = "tool_call_end"
+APPROVAL_REQUEST = "approval_request"
+APPROVAL_RESULT = "approval_result"
 CONTEXT_COMPACTION_START = "context_compaction_start"
 CONTEXT_COMPACTION_END = "context_compaction_end"
 CONTEXT_TRIM = "context_trim"
@@ -261,6 +272,24 @@ class RunLimits:
 
 
 @dataclass
+class ApprovalHooks:
+    """工具执行审批钩子（模块二）：由需要人工把关的调用方提供。
+
+    - open_request(info)：登记挂起审批请求并等待用户决议，返回
+      approved / rejected（info 为 approval_request 事件载荷，含 requestId）；
+    - settle_request(request_id, decision)：等待超时或运行取消时把注册表
+      里的挂起请求标记终态并清理（幂等）；
+    - timeout_seconds：等待上限，超时按拒绝处理。
+
+    评测路径不提供钩子：RuntimeRequest.approval 为 None 时一切照旧。
+    """
+
+    timeout_seconds: float
+    open_request: Callable[[dict[str, Any]], Awaitable[str]]
+    settle_request: Callable[[str, str], None]
+
+
+@dataclass
 class RuntimeRequest:
     """一次运行的全部输入。
 
@@ -272,6 +301,9 @@ class RuntimeRequest:
     summary_boundary_seq 为已压缩边界；压缩成功后 Runtime 通过
     persist_summary(summary, boundary) 把新摘要与边界一致保存到会话，
     未提供回调时压缩结果只保留在本次运行内。
+
+    approval 为审批钩子（见 ApprovalHooks）：提供后，命中审批范围的
+    工具调用（Shell 任意命令、文件写入、edit_file）会先请求人工审批。
     """
 
     agent_id: int
@@ -281,6 +313,7 @@ class RuntimeRequest:
     session_summary: str = ""
     summary_boundary_seq: int | None = None
     persist_summary: Callable[[str, int], None] | None = None
+    approval: ApprovalHooks | None = None
 
 
 @dataclass
@@ -595,6 +628,9 @@ class _RunState:
     registry: dict[str, _ToolEntry] = field(default_factory=dict)
     sessions: list[McpSession] = field(default_factory=list)
     secrets: list[str] = field(default_factory=list)
+    # 工具执行审批钩子（模块二）：None 表示本运行不审批（评测路径或未开启）
+    approval: ApprovalHooks | None = None
+    approval_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +668,7 @@ class AgentRuntime:
         缺省时 Runtime 自行生成。
         """
         state = _RunState(run_id=run_id or uuid.uuid4().hex, on_event=on_event)
+        state.approval = request.approval
         run_task = asyncio.current_task()
         watcher: asyncio.Task | None = None
         if cancel_event is not None and run_task is not None:
@@ -1765,7 +1802,15 @@ class AgentRuntime:
             )
         else:
             try:
-                outcome = await self._dispatch(state, config, entry, arguments)
+                decision = await self._maybe_request_approval(
+                    state, entry, arguments, round_no, tc_id
+                )
+                if decision is not None and decision != DECISION_APPROVED:
+                    # 拒绝 / 超时：未进入执行入口，把拒绝结果回给模型
+                    state.rejected_tool_calls += 1
+                    outcome = self._rejection_outcome(decision, name, state.approval)
+                else:
+                    outcome = await self._dispatch(state, config, entry, arguments)
             except asyncio.CancelledError:
                 # 取消时也给卡片一个明确终态，不得停留在“正在执行”
                 self._emit(
@@ -1811,6 +1856,113 @@ class AgentRuntime:
             outcome.summary,
         )
         plan.run_messages.append({"role": "tool", "tool_call_id": tc_id, "content": outcome.context_text})
+
+    # ---- 工具执行审批（模块二） ----
+
+    def tool_requires_approval(self, entry: _ToolEntry, arguments: dict[str, Any]) -> bool:
+        """本次工具调用是否需要人工审批（模块二范围，黑名单之外的第二层）。
+
+        Shell 工具的任何命令（命令最难预判，不做安全白名单）、文件读写
+        工具的写入操作（覆盖 / 新建 / 追加）、edit_file 的全部操作需要
+        审批；读取、列目录、搜索、时间与 Skill 加载不需要。MCP 工具
+        本版不做审批。
+        """
+        if entry.tool_type != TOOL_TYPE_BUILTIN:
+            return False
+        if entry.ref_key == "builtin_shell":
+            return True
+        if entry.ref_key == "builtin_file":
+            return arguments.get("action") == "write"
+        if entry.ref_key == "builtin_edit_file":
+            return True
+        return False
+
+    async def _maybe_request_approval(
+        self,
+        state: _RunState,
+        entry: _ToolEntry,
+        arguments: dict[str, Any],
+        round_no: int,
+        tc_id: str,
+    ) -> str | None:
+        """命中审批范围时发出 approval_request 并等待用户决议。
+
+        返回决定（approved / rejected / timeout）；None 表示无需审批，
+        调用方直接执行。等待超时按拒绝处理；等待期间运行被取消时，
+        先把挂起请求与审批事件收尾（cancelled）再向上抛出取消。
+        审批事件与工具事件一样进入运行记录，事后可在运行详情回放。
+        """
+        hooks = state.approval
+        if hooks is None or not self.tool_requires_approval(entry, arguments):
+            return None
+        state.approval_count += 1
+        request_id = f"apr-{state.approval_count}"
+        request_event = {
+            "type": APPROVAL_REQUEST,
+            "round": round_no,
+            "requestId": request_id,
+            "callId": tc_id,
+            "toolName": entry.name,
+            "toolType": entry.tool_type,
+            "displayName": entry.display_name,
+            "serverName": entry.server_name or None,
+            "arguments": _display_arguments(arguments, state.secrets),
+        }
+        self._emit(state, request_event)
+        try:
+            decision = await asyncio.wait_for(
+                hooks.open_request(dict(request_event)), timeout=hooks.timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            decision = DECISION_TIMEOUT
+            hooks.settle_request(request_id, decision)
+        except asyncio.CancelledError:
+            hooks.settle_request(request_id, DECISION_CANCELLED)
+            self._emit(state, self._approval_result_event(entry, round_no, request_id, tc_id, DECISION_CANCELLED))
+            raise
+        self._emit(state, self._approval_result_event(entry, round_no, request_id, tc_id, decision))
+        return decision
+
+    def _approval_result_event(
+        self,
+        entry: _ToolEntry,
+        round_no: int,
+        request_id: str,
+        tc_id: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        return {
+            "type": APPROVAL_RESULT,
+            "round": round_no,
+            "requestId": request_id,
+            "callId": tc_id,
+            "toolName": entry.name,
+            "toolType": entry.tool_type,
+            "decision": decision,
+        }
+
+    def _rejection_outcome(
+        self, decision: str, name: str, hooks: ApprovalHooks | None
+    ) -> _ToolOutcome:
+        """拒绝 / 超时的工具结果：明确告知模型被拒，引导调整方案而非原样重试。"""
+        if decision == DECISION_TIMEOUT:
+            wait_seconds = int(hooks.timeout_seconds) if hooks is not None else 0
+            context_text = (
+                f"调用被拒绝：工具「{name}」的执行审批等待了 {wait_seconds} 秒无人处理，"
+                "已按拒绝处理，本次未执行。请先向用户说明你准备做什么，或调整方案；"
+                "不要原样重试同样的调用。"
+            )
+            summary = f"审批超时：{name}"
+            display = f"审批等待超时（{wait_seconds} 秒），本次调用未执行。"
+        else:
+            context_text = (
+                f"调用被拒绝：用户拒绝了工具「{name}」的这次调用，本次未执行。"
+                "请理解用户可能不希望这个操作，调整方案后再继续；"
+                "不要原样重试同样的调用。"
+            )
+            summary = f"用户拒绝：{name}"
+            display = "用户拒绝了这次工具调用，本次未执行。"
+        return _ToolOutcome(ok=False, context_text=context_text, summary=summary, display=display)
 
     async def _dispatch(
         self, state: _RunState, config: _LoadedConfig, entry: _ToolEntry, arguments: dict[str, Any]

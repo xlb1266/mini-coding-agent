@@ -5,9 +5,9 @@
  * 与同一组件，保证同一次调用在两个页面显示一致的名称、状态与摘要。
  */
 
-import type { CompactActivity, ToolActivity } from '../stores/chat'
+import type { CompactActivity, ApprovalActivity, ToolActivity } from '../stores/chat'
 import type { RunEvent, RunItem, RunStatus } from '../api/runs'
-import type { CompactStatus, RunError, RunUsage, ToolType } from '../api/chat'
+import type { ApprovalDecisionStatus, CompactStatus, RunError, RunUsage, ToolType } from '../api/chat'
 
 // ---- 状态元数据（图标 + 文字，不只靠颜色区分） ----
 
@@ -139,6 +139,12 @@ export interface RunStartStep {
   agentName: string
 }
 
+export interface ApprovalStep {
+  kind: 'approval'
+  /** 复用聊天页的展示类型：ApprovalCard 只读渲染（终态展示，不可再决议） */
+  approval: ApprovalActivity
+}
+
 export interface RunEndStep {
   kind: 'run-end'
   eventId: number
@@ -154,7 +160,7 @@ export interface RunEndStep {
   roundsUsed?: number
 }
 
-export type RunTimelineStep = RunStartStep | ModelStep | ToolStep | CompactStep | RunEndStep
+export type RunTimelineStep = RunStartStep | ModelStep | ToolStep | ApprovalStep | CompactStep | RunEndStep
 
 function asStepStatus(value: unknown): StepStatus {
   return value === 'success' || value === 'error' || value === 'cancelled' || value === 'running'
@@ -178,6 +184,7 @@ export function buildTimeline(events: RunEvent[]): RunTimelineStep[] {
   const models = new Map<string, ModelStep>()
   const tools = new Map<string, ToolStep>()
   const compacts = new Map<string, CompactStep>()
+  const approvals = new Map<string, ApprovalStep>()
 
   for (const event of events) {
     const payload = event.payload
@@ -279,6 +286,34 @@ export function buildTimeline(events: RunEvent[]): RunTimelineStep[] {
         })
         break
       }
+      case 'approval_request': {
+        const requestId = payload.requestId ?? ''
+        const approval: ApprovalActivity = {
+          requestId,
+          callId: payload.callId ?? '',
+          toolName: payload.toolName ?? '',
+          displayName: payload.displayName || payload.toolName || '',
+          toolType: (payload.toolType as ToolType) ?? 'unknown',
+          status: 'pending',
+          arguments: payload.arguments ?? null,
+        }
+        const step: ApprovalStep = { kind: 'approval', approval }
+        steps.push(step)
+        approvals.set(requestId, step)
+        break
+      }
+      case 'approval_result': {
+        const step = approvals.get(payload.requestId ?? '')
+        if (step && step.approval.status === 'pending') {
+          const decision = payload.decision
+          step.approval.status = (
+            decision === 'approved' || decision === 'rejected' || decision === 'timeout'
+              ? decision
+              : 'cancelled'
+          ) as ApprovalDecisionStatus
+        }
+        break
+      }
       case 'run_end': {
         steps.push({
           kind: 'run-end',
@@ -295,6 +330,10 @@ export function buildTimeline(events: RunEvent[]): RunTimelineStep[] {
       default:
         break
     }
+  }
+  // 回放兜底：运行中断等导致审批缺少决定事件时，卡片不停留在“等待审批”
+  for (const step of approvals.values()) {
+    if (step.approval.status === 'pending') step.approval.status = 'cancelled'
   }
   return steps
 }

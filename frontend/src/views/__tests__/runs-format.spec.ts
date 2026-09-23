@@ -125,8 +125,69 @@ describe('runs-format 时间线构建', () => {
     } else throw new Error('应为裁剪步骤')
   })
 
-  it('摘要生成请求带 purpose 标记（不占用执行轮数）', () => {
-    const steps = buildTimeline([
+  it('审批起止按 requestId 配对回放；缺失决定事件时不停留在等待审批', () => {
+    const events = [
+      makeEvent('run_start', 1, { agentName: '审批助手' }),
+      makeEvent('tool_call_start', 2, {
+        callId: 'call_1',
+        toolName: 'builtin_shell',
+        toolType: 'builtin',
+        displayName: 'Shell 命令',
+        arguments: { command: 'echo hi' },
+      }),
+      makeEvent('approval_request', 3, {
+        requestId: 'apr-1',
+        callId: 'call_1',
+        toolName: 'builtin_shell',
+        toolType: 'builtin',
+        displayName: 'Shell 命令',
+        arguments: { command: 'echo hi' },
+      }),
+      makeEvent('approval_result', 4, {
+        requestId: 'apr-1',
+        callId: 'call_1',
+        toolName: 'builtin_shell',
+        toolType: 'builtin',
+        decision: 'rejected',
+      }),
+      makeEvent('tool_call_end', 5, {
+        callId: 'call_1',
+        toolName: 'builtin_shell',
+        toolType: 'builtin',
+        status: 'error',
+        durationMs: 10,
+        summary: '用户拒绝：builtin_shell',
+      }),
+      makeEvent('run_end', 6, { status: 'completed', reason: 'model_finished' }),
+    ]
+
+    const steps = buildTimeline(events)
+    const approvalStep = steps.find((step) => step.kind === 'approval')
+    expect(approvalStep).toBeDefined()
+    if (approvalStep?.kind === 'approval') {
+      expect(approvalStep.approval.requestId).toBe('apr-1')
+      expect(approvalStep.approval.status).toBe('rejected')
+      expect(approvalStep.approval.arguments).toEqual({ command: 'echo hi' })
+    }
+
+    // 只有请求、没有决定事件（运行中断）：卡片按已取消回放
+    const interrupted = buildTimeline([
+      makeEvent('run_start', 1, { agentName: '审批助手' }),
+      makeEvent('approval_request', 2, {
+        requestId: 'apr-1',
+        callId: 'call_1',
+        toolName: 'builtin_shell',
+        toolType: 'builtin',
+        displayName: 'Shell 命令',
+      }),
+    ])
+    const orphan = interrupted.find((step) => step.kind === 'approval')
+    if (orphan?.kind === 'approval') {
+      expect(orphan.approval.status).toBe('cancelled')
+    }
+  })
+
+  it('摘要生成请求带 purpose 标记（不占用执行轮数）', () => {    const steps = buildTimeline([
       makeEvent('model_request_start', 1, { callId: 'cmp-1-1', purpose: 'context_compaction' }),
       makeEvent('model_request_end', 2, { callId: 'cmp-1-1', purpose: 'context_compaction', status: 'success', durationMs: 500 }),
     ])

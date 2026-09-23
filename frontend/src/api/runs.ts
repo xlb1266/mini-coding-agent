@@ -57,6 +57,8 @@ export interface RunEventPayload {
   displayName?: string
   serverName?: string | null
   arguments?: Record<string, unknown> | null
+  requestId?: string
+  decision?: string
   summary?: string
   result?: ToolResultPayload | null
   hasDetail?: boolean

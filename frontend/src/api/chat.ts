@@ -30,8 +30,8 @@ export interface ChatSessionSummary {
   updatedAt: string
 }
 
-/** 进行中的生成状态：thinking 尚无正文，generating 正文输出中，tooling 工具执行中，compacting 压缩上下文中。 */
-export type GenerationPhase = 'thinking' | 'generating' | 'tooling' | 'compacting'
+/** 进行中的生成状态：thinking 尚无正文，generating 正文输出中，tooling 工具执行中，compacting 压缩上下文中，approval 等待审批。 */
+export type GenerationPhase = 'thinking' | 'generating' | 'tooling' | 'compacting' | 'approval'
 
 /** 上下文压缩卡片的状态；trimmed 为备用裁剪（只影响本次请求）。 */
 export type CompactStatus = 'running' | 'success' | 'partial' | 'error' | 'cancelled' | 'unknown' | 'trimmed'
@@ -52,6 +52,17 @@ export type GenerationTimelineItem =
       summary?: string
       arguments?: Record<string, unknown> | null
       result?: ToolResultPayload | null
+    }
+  | {
+      kind: 'approval'
+      requestId: string
+      callId: string
+      toolName: string
+      toolType: ToolType
+      displayName: string
+      serverName?: string | null
+      arguments?: Record<string, unknown> | null
+      status: ApprovalDecisionStatus
     }
   | {
       kind: 'compact'
@@ -78,6 +89,19 @@ export interface ChatGeneration {
   toolName?: string | null
   /** 展示时间线（重连/打开会话时恢复工具卡片与顺序）；刚启动时为空 */
   timeline?: GenerationTimelineItem[] | null
+  /** 当前仍在等待用户决议的审批请求（刷新后恢复审批卡片） */
+  pendingApprovals?: ApprovalRequestInfo[] | null
+}
+
+/** 一条挂起 / 已决定的审批请求信息（与后端 approval_request 事件载荷一致）。 */
+export interface ApprovalRequestInfo {
+  requestId: string
+  callId: string
+  toolName: string
+  toolType: ToolType
+  displayName: string
+  serverName?: string | null
+  arguments?: Record<string, unknown> | null
 }
 
 export interface ChatMessagesResult {
@@ -114,6 +138,9 @@ export type ToolType = 'builtin' | 'mcp' | 'skill' | 'unknown'
 /** 工具调用结束状态；cancelled 表示运行取消时被中断，结果未产出 */
 export type ToolEndStatus = 'success' | 'error' | 'cancelled'
 
+/** 审批卡片的决定状态：pending 为等待用户决议，其余为终态。 */
+export type ApprovalDecisionStatus = 'pending' | 'approved' | 'rejected' | 'timeout' | 'cancelled'
+
 /** 工具卡片展开视图的整理后结果；truncated 为真时 text 是截断后的前段 */
 export interface ToolResultPayload {
   text: string
@@ -140,6 +167,8 @@ export type ChatEvent =
       agentName: string
       toolName: string | null
       timeline?: GenerationTimelineItem[] | null
+      /** 当前仍在等待决议的审批请求（快照恢复审批卡片） */
+      pendingApprovals?: ApprovalRequestInfo[] | null
     }
   | { type: 'run_start'; runId: string; seq: number; agentName: string }
   | {
@@ -194,6 +223,32 @@ export type ChatEvent =
       durationMs: number
       summary: string
       result: ToolResultPayload | null
+    }
+  | {
+      /** 工具执行审批请求：等待用户批准/拒绝（开启审批的 Agent 命中审批范围时下发） */
+      type: 'approval_request'
+      runId: string
+      seq: number
+      round: number
+      requestId: string
+      callId: string
+      toolName: string
+      toolType: ToolType
+      displayName: string
+      serverName: string | null
+      arguments: Record<string, unknown> | null
+    }
+  | {
+      /** 审批决定：approved / rejected / timeout / cancelled */
+      type: 'approval_result'
+      runId: string
+      seq: number
+      round: number
+      requestId: string
+      callId: string
+      toolName: string
+      toolType: ToolType
+      decision: Exclude<ApprovalDecisionStatus, 'pending'>
     }
   | {
       type: 'run_end'
@@ -286,6 +341,22 @@ export function sendChatMessage(sessionId: number, content: string): Promise<Cha
 /** 停止生成；后端会保存已生成的部分正文。 */
 export function stopChatGeneration(sessionId: number): Promise<ChatStopResult> {
   return post<ChatStopResult>(`/api/chat/sessions/${sessionId}/stop`)
+}
+
+/** 查询会话当前挂起的工具执行审批请求。 */
+export function listChatApprovals(sessionId: number): Promise<ApprovalRequestInfo[]> {
+  return get<{ approvals: ApprovalRequestInfo[] }>(`/api/chat/sessions/${sessionId}/approvals`).then(
+    (result) => result.approvals,
+  )
+}
+
+/** 对一次审批做出决议；action 为 approve（批准）或 reject（拒绝）。 */
+export function decideChatApproval(
+  sessionId: number,
+  requestId: string,
+  action: 'approve' | 'reject',
+): Promise<{ requestId: string; action: string; outcome: string }> {
+  return post(`/api/chat/sessions/${sessionId}/approvals/${requestId}/decision`, { action })
 }
 
 /**

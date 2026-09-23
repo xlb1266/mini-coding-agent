@@ -21,6 +21,14 @@ SSE 事件（data 为 JSON，驼峰字段）：
                                                      工具调用结束（status 含
                                                      cancelled；result 为整理
                                                      后的展示文本）
+- {"type":"approval_request",...,"requestId","callId","arguments"}
+                                                     工具执行审批请求（开启
+                                                     审批的 Agent 命中审批
+                                                     范围时下发，等待用户决议）
+- {"type":"approval_result",...,"requestId","decision"}
+                                                     审批决定（approved /
+                                                     rejected / timeout /
+                                                     cancelled）
 - {"type":"context_compaction_start"|"context_compaction_end",...}
                                                      上下文压缩起止（触发
                                                      原因、前后估算 Token、
@@ -50,6 +58,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import settings
 from app.core.secret_box import SecretBox
 from app.db.models.chat import (
     ChatMessage,
@@ -66,6 +75,8 @@ from app.schemas.chat import (
     ChatMessageOut,
 )
 from app.services.agent_runtime import (
+    APPROVAL_REQUEST,
+    APPROVAL_RESULT,
     CONTEXT_COMPACTION_END,
     CONTEXT_COMPACTION_START,
     CONTEXT_TRIM,
@@ -78,8 +89,13 @@ from app.services.agent_runtime import (
     TOOL_CALL_END,
     TOOL_CALL_START,
     AgentRuntime,
+    ApprovalHooks,
     RuntimeRequest,
     redact,
+)
+from app.services.approvals import (
+    DECISION_CANCELLED,
+    approval_registry,
 )
 from app.services.model_client import ERROR_TYPE_SERVER
 from app.services.run_recorder import RunRecorder
@@ -91,11 +107,12 @@ from app.services.token_estimation import (
 logger = logging.getLogger(__name__)
 
 # 生成阶段：thinking 尚无正文；generating 正文流式输出中；tooling 工具执行中；
-# compacting 正在压缩上下文（生成长会话摘要）
+# compacting 正在压缩上下文（生成长会话摘要）；approval 等待用户审批工具执行
 PHASE_THINKING = "thinking"
 PHASE_GENERATING = "generating"
 PHASE_TOOLING = "tooling"
 PHASE_COMPACTING = "compacting"
+PHASE_APPROVAL = "approval"
 
 # 终态事件类型
 EVENT_RUN_END = RUN_END
@@ -203,6 +220,15 @@ def timeline_update_tool(timeline: list[dict[str, Any]], event: dict[str, Any]) 
     target["result"] = event.get("result")
 
 
+def timeline_update_approval(timeline: list[dict[str, Any]], event: dict[str, Any]) -> None:
+    """用 approval_result 更新时间线上对应的审批卡片（requestId 配对）。"""
+    request_id = event.get("requestId")
+    for item in reversed(timeline):
+        if item.get("kind") == "approval" and item.get("requestId") == request_id:
+            item["status"] = event.get("decision")
+            return
+
+
 def timeline_update_compact(timeline: list[dict[str, Any]], event: dict[str, Any]) -> None:
     """用 context_compaction_end 更新时间线上对应的压缩卡片（compactionId 配对）。"""
     compaction_id = event.get("compactionId")
@@ -266,6 +292,8 @@ class GenerationRun:
     # 会话压缩状态：当前有效摘要与已压缩边界（None 表示尚未压缩）
     session_summary: str = ""
     summary_boundary: int | None = None
+    # 工具执行审批（模块二）：Agent 开启审批时为 True，评测路径始终不审批
+    require_approval: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     run_id: str | None = None
     phase: str = PHASE_THINKING
@@ -320,6 +348,7 @@ class GenerationManager:
         model_id: int | None = None,
         model_name: str = "",
         model_identifier: str = "",
+        require_approval: bool = False,
     ) -> None:
         """启动一次后台运行；同一会话同时只允许一个运行。
 
@@ -343,6 +372,7 @@ class GenerationManager:
             model_identifier=model_identifier,
             session_summary=session_summary,
             summary_boundary=summary_boundary,
+            require_approval=require_approval,
         )
         recorder = RunRecorder(
             session_factory,
@@ -365,7 +395,11 @@ class GenerationManager:
         self._last_outcomes.pop(session_id, None)
 
     async def stop(self, session_id: int) -> dict[str, Any] | None:
-        """请求停止运行并等待收尾，返回终态事件（无任务时 None）。"""
+        """请求停止运行并等待收尾，返回终态事件（无任务时 None）。
+
+        挂起的审批请求一并取消：Runtime 的等待被任务取消打断后走统一
+        收尾路径；这里在任务结束后再兜底清理一次，保证注册表不留悬挂项。
+        """
         run = self._runs.get(session_id)
         if run is None or run.task is None:
             return None
@@ -373,6 +407,7 @@ class GenerationManager:
         run.cancel_event.set()
         run.task.cancel()
         await asyncio.gather(run.task, return_exceptions=True)
+        approval_registry.cancel_for_session(session_id)
         return self._last_outcomes.get(session_id)
 
     async def close(self) -> None:
@@ -382,6 +417,8 @@ class GenerationManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for session_id in list(self._runs):
+            approval_registry.cancel_for_session(session_id)
 
     # ---- 订阅 ----
 
@@ -424,6 +461,8 @@ class GenerationManager:
                 run.recorder.finish(event)
             except Exception:
                 logger.exception("保存运行终态失败 session_id=%s run_id=%s", run.session_id, run.run_id)
+        # 运行结束的兜底清理：仍有挂起的审批请求（如异常路径遗漏）标记取消
+        approval_registry.cancel_for_run(run.run_id)
         self._last_outcomes[run.session_id] = event
         self._broadcast(run, event)
         self._runs.pop(run.session_id, None)
@@ -437,6 +476,10 @@ class GenerationManager:
             "agentName": run.agent_name,
             "toolName": run.tool_name,
             "timeline": [dict(item) for item in run.timeline],
+            # 当前仍在等待决议的审批请求：刷新 / 重新打开页面后恢复审批卡片
+            "pendingApprovals": [
+                approval.payload() for approval in approval_registry.pending_for_run(run.run_id)
+            ],
         }
 
     def _save_assistant_message(self, run: GenerationRun, status: str) -> ChatMessage:
@@ -525,6 +568,29 @@ class GenerationManager:
             run.timeline.append(timeline_compact_item(event))
             self._broadcast(run, event)
             return
+        if event_type == APPROVAL_REQUEST:
+            # 审批卡片进入时间线；等待决议期间阶段标记为 approval
+            run.phase = PHASE_APPROVAL
+            run.timeline.append(
+                {
+                    "kind": "approval",
+                    "requestId": event.get("requestId"),
+                    "callId": event.get("callId"),
+                    "toolName": event.get("toolName"),
+                    "toolType": event.get("toolType"),
+                    "displayName": event.get("displayName"),
+                    "serverName": event.get("serverName"),
+                    "arguments": event.get("arguments"),
+                    "status": "pending",
+                }
+            )
+            self._broadcast(run, event)
+            return
+        if event_type == APPROVAL_RESULT:
+            run.phase = PHASE_GENERATING if run.content.strip() else PHASE_THINKING
+            timeline_update_approval(run.timeline, event)
+            self._broadcast(run, event)
+            return
         if event_type == RUN_END:
             self._handle_run_end(run, event)
             return
@@ -572,6 +638,19 @@ class GenerationManager:
         finally:
             db.close()
 
+    async def _wait_approval(self, run: GenerationRun, info: dict[str, Any]) -> str:
+        """审批钩子：登记挂起请求并等待用户决议，返回 approved / rejected。
+
+        等待被取消（用户停止生成会取消等待；等待超时由 Runtime 控制）
+        时，把挂起请求标记为取消并向上传播，注册表与后台任务都不悬挂。
+        """
+        approval = approval_registry.create(run.session_id, run.run_id, info)
+        try:
+            return await approval.future
+        except asyncio.CancelledError:
+            approval_registry.settle(approval.request_id, DECISION_CANCELLED)
+            raise
+
     async def _execute(self, run: GenerationRun) -> None:
         """后台任务：调用统一 Agent Runtime 执行一次运行。"""
         try:
@@ -580,6 +659,17 @@ class GenerationManager:
                 secret_box=run.secret_box,
                 skills_dir=run.skills_dir,
             )
+            # 审批钩子仅当 Agent 开启审批时提供；评测路径不经过这里，
+            # RuntimeRequest.approval 为 None，工具调用一律自动执行
+            approval_hooks: ApprovalHooks | None = None
+            if run.require_approval:
+                approval_hooks = ApprovalHooks(
+                    timeout_seconds=settings.approval_timeout_seconds,
+                    open_request=lambda info: self._wait_approval(run, info),
+                    settle_request=lambda request_id, decision: approval_registry.settle(
+                        request_id, decision
+                    ),
+                )
             request = RuntimeRequest(
                 agent_id=run.agent_id,
                 user_input=run.user_input,
@@ -589,6 +679,7 @@ class GenerationManager:
                 persist_summary=lambda summary, boundary: self._persist_summary(
                     run, summary, boundary
                 ),
+                approval=approval_hooks,
             )
             await runtime.run(
                 request,

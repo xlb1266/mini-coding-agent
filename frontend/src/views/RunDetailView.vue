@@ -11,6 +11,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import PageHeader from '../components/PageHeader.vue'
+import ApprovalCard from '../components/ApprovalCard.vue'
 import ToolCallCard from '../components/ToolCallCard.vue'
 import CompactionCard from '../components/CompactionCard.vue'
 import type { RunDetail, RunItem } from '../api/runs'
@@ -236,6 +237,11 @@ function isLoadingDetail(eventId: number): boolean {
                 </button>
               </template>
             </ToolCallCard>
+          </div>
+
+          <!-- 工具执行审批（复用聊天页卡片；历史回放只读，不可再决议） -->
+          <div v-else-if="step.kind === 'approval'" class="tool-wrap">
+            <ApprovalCard :approval="step.approval" />
           </div>
 
           <!-- 上下文压缩 / 裁剪（复用聊天页卡片） -->

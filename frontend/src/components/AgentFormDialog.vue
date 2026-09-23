@@ -283,6 +283,18 @@ function bindingBadge(binding: AgentBindingRef): string {
         <p v-if="errors.workspaceDir" class="field-error">{{ errors.workspaceDir }}</p>
       </div>
 
+      <div class="form-field approval-section">
+        <label class="compact-toggle">
+          <input v-model="values.requireApproval" type="checkbox" />
+          执行审批
+        </label>
+        <p class="field-hint">
+          开启后，Agent 执行 Shell 命令、写入文件（覆盖 / 新建 / 追加）或编辑文件（edit_file）前会暂停，
+          在聊天页展示审批卡片，等你批准或拒绝；拒绝与超时（默认 300 秒）都会把结果告知模型。
+          读取、列目录、搜索等只读操作不需要审批。默认关闭。
+        </p>
+      </div>
+
       <div class="form-field compact-section">
         <label class="compact-toggle">
           <input v-model="values.autoCompact" type="checkbox" />
@@ -611,6 +623,14 @@ function bindingBadge(binding: AgentBindingRef): string {
 }
 
 .compact-section {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+}
+
+/* 执行审批开关区块：与压缩配置区块同一视觉样式 */
+.approval-section {
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;

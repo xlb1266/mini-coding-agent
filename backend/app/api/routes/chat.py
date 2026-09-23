@@ -12,7 +12,10 @@
   压缩边界之后的消息，被摘要覆盖的原文不重复进入上下文；
 - 停止生成、关闭页面或浏览器断开会触发取消，已生成的部分正文保存为
   未完成；无运行任务时停止幂等返回 not_running；
-- 同一会话生成中禁止重复发送与切换 Agent（409）。
+- 同一会话生成中禁止重复发送与切换 Agent（409）；
+- 工具执行审批（模块二）：开启审批的 Agent 执行高风险工具前经 SSE 下发
+  审批请求并挂起等待；决议走 /approvals/{request_id}/decision，查询挂起
+  走 /approvals；未开启审批的 Agent 与评测路径不触发审批；
 """
 
 import asyncio
@@ -31,6 +34,10 @@ from app.db.session import get_db, get_session_factory
 from app.schemas.chat import (
     DEFAULT_SESSION_TITLE,
     ChatAgentSelectRequest,
+    ChatApprovalDecisionRequest,
+    ChatApprovalDecisionResultOut,
+    ChatApprovalListOut,
+    ChatApprovalOut,
     ChatGenerationOut,
     ChatMessageOut,
     ChatMessagesOut,
@@ -41,6 +48,7 @@ from app.schemas.chat import (
     ChatStopResultOut,
 )
 from app.api.routes.skills import get_skills_dir
+from app.services.approvals import approval_registry
 from app.services.chat_generation import (
     TERMINAL_EVENTS,
     estimate_context_tokens,
@@ -168,6 +176,10 @@ def get_messages(session_id: int, db: Session = Depends(get_db)) -> ChatMessages
             agent_name=run.agent_name,
             tool_name=run.tool_name,
             timeline=[dict(item) for item in run.timeline],
+            pending_approvals=[
+                approval.payload()
+                for approval in approval_registry.pending_for_run(run.run_id)
+            ],
         )
     return ChatMessagesOut(
         session=_session_out(db, session),
@@ -319,6 +331,7 @@ async def send_message(
         model_id=model.id,
         model_name=model.display_name,
         model_identifier=model.model_identifier,
+        require_approval=agent.require_approval,
     )
 
     return ChatSendResultOut(
@@ -350,6 +363,57 @@ async def stop_generation(session_id: int, db: Session = Depends(get_db)) -> Cha
         result.hint = error.get("hint")
         result.error_type = error.get("type")
     return result
+
+
+@router.get("/sessions/{session_id}/approvals")
+def list_pending_approvals(
+    session_id: int, db: Session = Depends(get_db)
+) -> ChatApprovalListOut:
+    """查询当前挂起的工具执行审批请求；没有生成任务时返回空列表。"""
+    _get_session_or_404(db, session_id)
+    approvals = [
+        ChatApprovalOut(
+            request_id=approval.request_id,
+            tool_name=approval.tool_name,
+            display_name=approval.display_name,
+            tool_type=approval.tool_type,
+            arguments=approval.arguments,
+            created_at=approval.created_at,
+        )
+        for approval in approval_registry.pending_for_session(session_id)
+    ]
+    return ChatApprovalListOut(approvals=approvals)
+
+
+@router.post("/sessions/{session_id}/approvals/{request_id}/decision")
+async def decide_approval(
+    session_id: int,
+    request_id: str,
+    payload: ChatApprovalDecisionRequest,
+    db: Session = Depends(get_db),
+) -> ChatApprovalDecisionResultOut:
+    """对一次挂起的审批做出批准/拒绝决议，Runtime 随即继续或把拒绝回给模型。
+
+    只有会话处于生成中才允许决议：会话不存在 404，未在生成 409，
+    审批请求不存在或已被处理 404。
+    """
+    _get_session_or_404(db, session_id)
+    if not generation_manager.is_generating(session_id):
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="当前会话没有进行中的生成任务，无需审批")
+    if payload.action not in ("approve", "reject"):
+        raise HTTPException(
+            status_code=FIELD_ERROR_STATUS,
+            detail={"message": "审批决议只能是 approve 或 reject", "fields": {"action": "审批决议只能是 approve 或 reject"}},
+        )
+    approval = approval_registry.get(request_id)
+    if approval is None or approval.session_id != session_id:
+        raise HTTPException(status_code=404, detail="审批请求不存在或已被处理")
+    approval_registry.resolve(request_id, payload.approved)
+    return ChatApprovalDecisionResultOut(
+        request_id=request_id,
+        action=payload.action,
+        outcome="approved" if payload.approved else "rejected",
+    )
 
 
 @router.get("/sessions/{session_id}/events")

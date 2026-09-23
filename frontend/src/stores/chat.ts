@@ -14,18 +14,25 @@
  * 阶段十：时间线增加压缩卡片段（kind: 'compact'）——上下文压缩起止用
  * compactionId 配对、原地更新，备用裁剪直接追加；压缩期间的阶段为
  * compacting。卡片只展示估算数字与原因，不包含摘要正文。
+ *
+ * 模块二：时间线增加审批卡片段（kind: 'approval'）——开启审批的 Agent
+ * 执行高风险工具前暂停，approval_request 建卡（pending），approval_result
+ * 用 requestId 配对原地更新为终态（approved/rejected/timeout/cancelled）；
+ * 阶段为 approval。决议经 decideApproval 调用后端接口，等待期间按钮置灰。
  */
 
 import { defineStore } from 'pinia'
 
 import {
   createChatSession as apiCreateSession,
+  decideChatApproval as apiDecideApproval,
   getChatMessages as apiGetMessages,
   listChatSessions,
   openChatEventStream,
   selectChatAgent as apiSelectAgent,
   sendChatMessage as apiSendMessage,
   stopChatGeneration as apiStopGeneration,
+  type ApprovalDecisionStatus,
   type ChatEvent,
   type ChatGeneration,
   type ChatMessage,
@@ -37,6 +44,8 @@ import {
   type ToolResultPayload,
   type ToolType,
 } from '../api/chat'
+
+export type { ApprovalDecisionStatus }
 
 /** 一次生成失败的原因与已生成内容（未保存部分只在内存中）。 */
 export interface GenerationError {
@@ -93,7 +102,22 @@ export interface CompactActivity {
   error?: RunError | null
 }
 
-/** 生成时间线的三种段：正文段、工具卡片段与压缩卡片段，按事件顺序交错。 */
+/** 审批卡片的展示状态：pending 等待决议（按钮可点），其余为终态。 */
+export interface ApprovalActivity {
+  requestId: string
+  callId: string
+  toolName: string
+  displayName: string
+  toolType: ToolType
+  status: ApprovalDecisionStatus
+  arguments: Record<string, unknown> | null
+  /** 决议请求进行中：按钮置灰防重复提交 */
+  deciding?: boolean
+  /** 决议失败时的提示（如审批已被处理） */
+  error?: string | null
+}
+
+/** 生成时间线的段：正文段、工具/审批/压缩卡片段，按事件顺序交错。 */
 export interface TextSegment {
   kind: 'text'
   text: string
@@ -104,12 +128,17 @@ export interface ToolSegment {
   tool: ToolActivity
 }
 
+export interface ApprovalSegment {
+  kind: 'approval'
+  approval: ApprovalActivity
+}
+
 export interface CompactSegment {
   kind: 'compact'
   compact: CompactActivity
 }
 
-export type GenerationSegment = TextSegment | ToolSegment | CompactSegment
+export type GenerationSegment = TextSegment | ToolSegment | ApprovalSegment | CompactSegment
 
 /** 进行中的生成：正文与工具卡片按事件顺序交错保留。 */
 export interface RunningGeneration {
@@ -175,6 +204,20 @@ function matchCompact(segments: GenerationSegment[], compactionId: string): Comp
   return null
 }
 
+/** 在时间线里定位 requestId 对应的审批卡片。 */
+function matchApproval(
+  segments: GenerationSegment[],
+  requestId: string,
+): ApprovalActivity | null {
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const segment = segments[i]!
+    if (segment.kind === 'approval' && segment.approval.requestId === requestId) {
+      return segment.approval
+    }
+  }
+  return null
+}
+
 /** 收尾扫描：仍在执行的卡片标记为取消或状态未知，不得停留在“执行中”或误标成功。 */
 function finalizeActivities(segments: GenerationSegment[], status: ToolActivityStatus): void {
   for (const segment of segments) {
@@ -183,6 +226,10 @@ function finalizeActivities(segments: GenerationSegment[], status: ToolActivityS
     }
     if (segment.kind === 'compact' && segment.compact.status === 'running') {
       segment.compact.status = status
+    }
+    if (segment.kind === 'approval' && segment.approval.status === 'pending') {
+      // 运行结束（停止/断连）时未决议的审批不再有效
+      segment.approval.status = 'cancelled'
     }
   }
 }
@@ -217,6 +264,19 @@ function segmentsFromTimeline(
           summary: item.summary,
           arguments: item.arguments ?? null,
           result: item.result ?? null,
+        },
+      })
+    } else if (item.kind === 'approval') {
+      segments.push({
+        kind: 'approval',
+        approval: {
+          requestId: item.requestId,
+          callId: item.callId,
+          toolName: item.toolName,
+          displayName: item.displayName || item.toolName,
+          toolType: item.toolType,
+          status: item.status,
+          arguments: item.arguments ?? null,
         },
       })
     } else {
@@ -383,9 +443,25 @@ export const useChatStore = defineStore('chat', {
       this.abortStream(sessionId)
     },
 
+    /** 对一次审批做出决议：后端决议成功后，approval_result 事件会更新卡片终态。
+     *  等待响应期间按钮置灰防重复提交；失败（如审批已被处理）把错误显示在卡片上。 */
+    async decideApproval(sessionId: number, requestId: string, approved: boolean): Promise<void> {
+      const generation = this.generations[sessionId]
+      if (!generation) return
+      const approval = matchApproval(generation.segments, requestId)
+      if (!approval || approval.status !== 'pending' || approval.deciding) return
+      approval.deciding = true
+      approval.error = null
+      try {
+        await apiDecideApproval(sessionId, requestId, approved ? 'approve' : 'reject')
+      } catch (error) {
+        approval.deciding = false
+        approval.error = error instanceof Error ? error.message : '审批操作失败，请重试'
+      }
+    },
+
     /** 切换会话的 Agent（只影响后续请求）。 */
-    async changeAgent(agentId: number): Promise<void> {
-      const sessionId = this.activeSessionId
+    async changeAgent(agentId: number): Promise<void> {      const sessionId = this.activeSessionId
       if (sessionId === null) {
         return
       }
@@ -495,6 +571,33 @@ export const useChatStore = defineStore('chat', {
         }
         return
       }
+      if (event.type === 'approval_request') {
+        // 审批卡片进入时间线；等待决议期间阶段标记为 approval
+        generation.phase = 'approval'
+        generation.segments.push({
+          kind: 'approval',
+          approval: {
+            requestId: event.requestId,
+            callId: event.callId,
+            toolName: event.toolName,
+            displayName: event.displayName || event.toolName,
+            toolType: event.toolType,
+            status: 'pending',
+            arguments: event.arguments ?? null,
+          },
+        })
+        return
+      }
+      if (event.type === 'approval_result') {
+        generation.phase = segmentsText(generation.segments) ? 'generating' : 'thinking'
+        // requestId 配对、原地更新审批卡片终态
+        const approval = matchApproval(generation.segments, event.requestId)
+        if (approval) {
+          approval.status = event.decision
+          approval.deciding = false
+        }
+        return
+      }
       if (event.type === 'context_compaction_start') {
         generation.phase = 'compacting'
         generation.segments.push({
@@ -571,7 +674,7 @@ export const useChatStore = defineStore('chat', {
       } else {
         // 没有保存消息（取消且无正文 / 保存失败）：卡片单独留在会话末尾
         this.orphanSegments[sessionId] = generation.segments.filter(
-          (segment): segment is ToolSegment | CompactSegment => segment.kind !== 'text',
+          (segment): segment is ToolSegment | ApprovalSegment | CompactSegment => segment.kind !== 'text',
         )
       }
     },
@@ -619,7 +722,7 @@ export const useChatStore = defineStore('chat', {
       finalizeActivities(generation.segments, 'unknown')
       if (hasActivity(generation.segments)) {
         this.orphanSegments[sessionId] = generation.segments.filter(
-          (segment): segment is ToolSegment | CompactSegment => segment.kind !== 'text',
+          (segment): segment is ToolSegment | ApprovalSegment | CompactSegment => segment.kind !== 'text',
         )
       }
       this.generationErrors[sessionId] = {

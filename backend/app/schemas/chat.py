@@ -81,10 +81,11 @@ class ChatSessionOut(CamelModel):
 
 
 class ChatGenerationOut(CamelModel):
-    """当前会话正在生成的状态快照（thinking 尚无正文，generating 有部分正文，tooling 工具执行中）。
+    """当前会话正在生成的状态快照（thinking 尚无正文，generating 有部分正文，tooling 工具执行中，approval 等待审批）。
 
-    timeline 为展示时间线（正文段与工具卡片段按事件顺序交错），供前端
-    恢复工具卡片与消息顺序；运行刚启动或无内容时为空列表。
+    timeline 为展示时间线（正文段与工具/审批/压缩卡片段按事件顺序交错），
+    供前端恢复卡片与消息顺序；运行刚启动或无内容时为空列表。
+    pendingApprovals 为当前仍在等待用户决议的审批请求（刷新后恢复展示）。
     """
 
     phase: str
@@ -93,6 +94,48 @@ class ChatGenerationOut(CamelModel):
     # 正在执行的工具展示名（仅 tooling 阶段）
     tool_name: str | None = None
     timeline: list[dict[str, Any]] = []
+    pending_approvals: list[dict[str, Any]] = []
+
+
+class ChatApprovalDecisionRequest(CamelModel):
+    """对一次工具执行审批的决议；action 为 approve（批准）或 reject（拒绝）。"""
+
+    action: str
+
+    @property
+    def approved(self) -> bool:
+        return self.action == "approve"
+
+
+class ChatApprovalOut(CamelModel):
+    """一条挂起的审批请求；arguments 为 Runtime 整理后的展示参数。"""
+
+    request_id: str
+    tool_name: str
+    display_name: str
+    tool_type: str
+    arguments: Any = None
+    created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_datetime(self, value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+
+
+class ChatApprovalListOut(CamelModel):
+    """会话当前挂起的审批请求列表。"""
+
+    approvals: list[ChatApprovalOut] = []
+
+
+class ChatApprovalDecisionResultOut(CamelModel):
+    """决议结果：outcome 为 approved / rejected。"""
+
+    request_id: str
+    action: str
+    outcome: str
 
 
 class ChatMessagesOut(CamelModel):

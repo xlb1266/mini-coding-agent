@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import PageHeader from '../components/PageHeader.vue'
+import ApprovalCard from '../components/ApprovalCard.vue'
 import CompactionCard from '../components/CompactionCard.vue'
 import MarkdownContent from '../components/MarkdownContent.vue'
 import ToolCallCard from '../components/ToolCallCard.vue'
@@ -218,8 +219,15 @@ const phaseLabel = computed(() => {
   if (phase === 'tooling') return '调用工具'
   if (phase === 'generating') return '生成'
   if (phase === 'compacting') return '压缩上下文'
+  if (phase === 'approval') return '等待审批'
   return '思考'
 })
+
+/** 对一次审批做出决议；结果由 approval_result 事件更新到卡片上。 */
+function handleDecide(requestId: string, approved: boolean): void {
+  if (!session.value) return
+  void chatStore.decideApproval(session.value.id, requestId, approved)
+}
 
 function formatMessageTime(iso: string): string {
   const date = new Date(iso)
@@ -336,6 +344,11 @@ function formatSessionTime(iso: string): string {
                   <template v-for="(segment, index) in timelineFor(message)" :key="index">
                     <MarkdownContent v-if="segment.kind === 'text'" :text="segment.text" />
                     <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
+                    <ApprovalCard
+                      v-else-if="segment.kind === 'approval'"
+                      :approval="segment.approval"
+                      @decide="(approved) => handleDecide(segment.approval.requestId, approved)"
+                    />
                     <CompactionCard v-else :compact="segment.compact" />
                   </template>
                 </template>
@@ -353,6 +366,11 @@ function formatSessionTime(iso: string): string {
                     v-if="segment.kind === 'tool'"
                     :tool="segment.tool"
                     @toggle="handleCardToggle"
+                  />
+                  <ApprovalCard
+                    v-else-if="segment.kind === 'approval'"
+                    :approval="segment.approval"
+                    @decide="(approved) => handleDecide(segment.approval.requestId, approved)"
                   />
                   <CompactionCard v-else-if="segment.kind === 'compact'" :compact="segment.compact" />
                 </template>
@@ -372,9 +390,14 @@ function formatSessionTime(iso: string): string {
                     :cursor="generation.phase === 'generating' && index === generation.segments.length - 1"
                   />
                   <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
+                  <ApprovalCard
+                    v-else-if="segment.kind === 'approval'"
+                    :approval="segment.approval"
+                    @decide="(approved) => handleDecide(segment.approval.requestId, approved)"
+                  />
                   <CompactionCard v-else :compact="segment.compact" />
                 </template>
-                <div v-if="generation.phase !== 'generating'" class="bubble-content thinking">
+                <div v-if="generation.phase !== 'generating' && generation.phase !== 'approval'" class="bubble-content thinking">
                   <template v-if="generation.phase === 'tooling'">正在调用工具：{{ generation.toolName }}<span class="dots">…</span></template>
                   <template v-else-if="generation.phase === 'compacting'">正在压缩上下文<span class="dots">…</span></template>
                   <template v-else>正在思考<span class="dots">…</span></template>

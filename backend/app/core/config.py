@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # MCP 工具在 Agent 运行期间的单次调用超时秒数
     mcp_tool_call_timeout_seconds: float = 60.0
 
+    # 工具执行审批：等待用户批准/拒绝的超时秒数，超时按拒绝处理（模块二）
+    approval_timeout_seconds: float = 300.0
+
     # 前端开发服务器地址；日常开发走 Vite 代理（同源），此配置仅作直连兜底
     cors_origins: list[str] = [
         "http://localhost:5173",

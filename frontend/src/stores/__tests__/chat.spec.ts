@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createChatSession,
+  decideChatApproval,
   getChatMessages,
   listChatSessions,
   openChatEventStream,
@@ -14,7 +15,7 @@ import {
   type ChatSessionSummary,
 } from '../../api/chat'
 import { segmentsText, useChatStore } from '../chat'
-import type { GenerationSegment, RunningGeneration, ToolSegment } from '../chat'
+import type { ApprovalSegment, GenerationSegment, RunningGeneration, ToolSegment } from '../chat'
 
 vi.mock('../../api/chat', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/chat')>()
@@ -27,6 +28,7 @@ vi.mock('../../api/chat', async (importOriginal) => {
     sendChatMessage: vi.fn(),
     stopChatGeneration: vi.fn(),
     openChatEventStream: vi.fn(),
+    decideChatApproval: vi.fn(),
   }
 })
 
@@ -826,5 +828,177 @@ describe('chat store 上下文压缩', () => {
     expect(store.orphanSegments[1]).toHaveLength(1)
     const compact = store.orphanSegments[1]![0] as Extract<GenerationSegment, { kind: 'compact' }>
     expect(compact.compact.status).toBe('cancelled')
+  })
+})
+
+describe('chat store 工具执行审批（模块二）', () => {
+  function approvalRequestEvent(overrides: Record<string, unknown> = {}): ChatEvent {
+    return {
+      type: 'approval_request',
+      runId: 'r1',
+      seq: 5,
+      round: 1,
+      requestId: 'apr-1',
+      callId: 'call_1',
+      toolName: 'builtin_shell',
+      toolType: 'builtin',
+      displayName: 'Shell 命令',
+      serverName: null,
+      arguments: { command: 'echo hi' },
+      ...overrides,
+    } as ChatEvent
+  }
+
+  function approvalResultEvent(overrides: Record<string, unknown> = {}): ChatEvent {
+    return {
+      type: 'approval_result',
+      runId: 'r1',
+      seq: 6,
+      round: 1,
+      requestId: 'apr-1',
+      callId: 'call_1',
+      toolName: 'builtin_shell',
+      toolType: 'builtin',
+      decision: 'approved',
+      ...overrides,
+    } as ChatEvent
+  }
+
+  function approvalSegments(generation: RunningGeneration | undefined): ApprovalSegment[] {
+    return (generation?.segments ?? []).filter(
+      (segment): segment is ApprovalSegment => segment.kind === 'approval',
+    )
+  }
+
+  async function setupActive(): Promise<void> {
+    const session = makeSession()
+    vi.mocked(listChatSessions).mockResolvedValue([session])
+    vi.mocked(getChatMessages).mockResolvedValue({ session, messages: [], generation: null })
+    const store = useChatStore()
+    await store.fetchSessions()
+    await store.selectSession(1)
+    store.generations[1] = makeGeneration()
+    store.subscribeEvents(1)
+  }
+
+  it('approval_request 建卡进入 approval 阶段；approval_result 原地更新终态', async () => {
+    await setupActive()
+    const store = useChatStore()
+
+    emitEvent({ type: 'text_delta', runId: 'r1', seq: 2, round: 1, callId: 'mr-1', text: '我来执行' })
+    emitEvent(approvalRequestEvent())
+
+    const generation = store.generations[1]!
+    expect(generation.phase).toBe('approval')
+    const approval = approvalSegments(generation)[0]!.approval
+    expect(approval.status).toBe('pending')
+    expect(approval.toolName).toBe('builtin_shell')
+    expect(approval.arguments).toEqual({ command: 'echo hi' })
+
+    emitEvent(approvalResultEvent())
+    expect(generation.phase).toBe('generating')
+    expect(approval.status).toBe('approved')
+    expect(approval.deciding).toBe(false)
+  })
+
+  it('decideApproval 调用后端决议并在等待期间置灰；失败显示错误', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent(approvalRequestEvent())
+    const approval = approvalSegments(store.generations[1]!)[0]!.approval
+
+    // 正常决议
+    vi.mocked(decideChatApproval).mockResolvedValueOnce({
+      requestId: 'apr-1',
+      action: 'approve',
+      outcome: 'approved',
+    })
+    const deciding = store.decideApproval(1, 'apr-1', true)
+    expect(approval.deciding).toBe(true)
+    await deciding
+    expect(decideChatApproval).toHaveBeenCalledWith(1, 'apr-1', 'approve')
+    expect(approval.error).toBeNull()
+
+    // 决议失败（如审批已被处理）：按钮恢复可点，错误显示在卡片
+    vi.mocked(decideChatApproval).mockRejectedValueOnce(new Error('审批请求不存在或已被处理'))
+    emitEvent(approvalRequestEvent({ requestId: 'apr-2', seq: 7 }))
+    await store.decideApproval(1, 'apr-2', false)
+    const second = approvalSegments(store.generations[1]!).find((s) => s.approval.requestId === 'apr-2')!
+      .approval
+    expect(second.deciding).toBe(false)
+    expect(second.error).toBe('审批请求不存在或已被处理')
+  })
+
+  it('已决定或正在提交的审批不重复提交', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent(approvalRequestEvent())
+    emitEvent(approvalResultEvent())
+
+    await store.decideApproval(1, 'apr-1', true)
+    expect(decideChatApproval).not.toHaveBeenCalled()
+  })
+
+  it('run_end 取消时未决议的审批标记为已取消', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent(approvalRequestEvent())
+    emitEvent({
+      type: 'run_end',
+      runId: 'r1',
+      seq: 99,
+      status: 'cancelled',
+      reason: 'cancelled',
+      roundsUsed: 1,
+      content: '',
+      message: null,
+      error: null,
+    })
+
+    expect(store.orphanSegments[1]).toHaveLength(1)
+    const approval = store.orphanSegments[1]![0] as Extract<GenerationSegment, { kind: 'approval' }>
+    expect(approval.approval.status).toBe('cancelled')
+  })
+
+  it('快照时间线恢复审批卡片（刷新后仍在等待的审批继续展示）', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent({
+      type: 'snapshot',
+      runId: 'r1',
+      phase: 'approval',
+      content: '',
+      agentName: '测试助手',
+      toolName: null,
+      pendingApprovals: [
+        {
+          requestId: 'apr-1',
+          callId: 'call_1',
+          toolName: 'builtin_shell',
+          toolType: 'builtin',
+          displayName: 'Shell 命令',
+          arguments: { command: 'echo hi' },
+        },
+      ],
+      timeline: [
+        { kind: 'text', text: '准备执行命令' },
+        {
+          kind: 'approval',
+          requestId: 'apr-1',
+          callId: 'call_1',
+          toolName: 'builtin_shell',
+          toolType: 'builtin',
+          displayName: 'Shell 命令',
+          arguments: { command: 'echo hi' },
+          status: 'pending',
+        },
+      ],
+    })
+
+    const generation = store.generations[1]!
+    expect(generation.phase).toBe('approval')
+    const approval = approvalSegments(generation)[0]!.approval
+    expect(approval.status).toBe('pending')
+    expect(approval.displayName).toBe('Shell 命令')
   })
 })
