@@ -18,6 +18,8 @@ export interface ChatMessage {
   agentName: string | null
   seq: number
   createdAt: string
+  /** 该次回复的过程轨迹（思考段与工具卡片段）；纯文字回复为 null */
+  timeline?: GenerationTimelineItem[] | null
 }
 
 export interface ChatSessionSummary {
@@ -36,10 +38,16 @@ export type GenerationPhase = 'thinking' | 'generating' | 'tooling' | 'compactin
 /** 上下文压缩卡片的状态；trimmed 为备用裁剪（只影响本次请求）。 */
 export type CompactStatus = 'running' | 'success' | 'partial' | 'error' | 'cancelled' | 'unknown' | 'trimmed'
 
-/** 展示时间线条目：正文段、工具卡片段或上下文压缩段（与后端结构一致）。
+/** 展示时间线条目：正文段、思考段、工具卡片段或上下文压缩段（与后端结构一致）。
  *  Token 数字均为估算值，与模型接口返回的实际用量（usage）区分。 */
 export type GenerationTimelineItem =
   | { kind: 'text'; text: string }
+  | {
+      /** 模型思考段（推理模型下发；仅展示，不进入保存的回复正文） */
+      kind: 'reasoning'
+      text: string
+      durationMs?: number | null
+    }
   | {
       kind: 'tool'
       callId: string
@@ -87,6 +95,8 @@ export interface ChatGeneration {
   agentName: string
   /** 正在执行的工具展示名（仅 tooling 阶段） */
   toolName?: string | null
+  /** 运行开始时间（epoch 毫秒）：展示“处理中 Xs”，刷新后仍准确 */
+  startedAt?: number | null
   /** 展示时间线（重连/打开会话时恢复工具卡片与顺序）；刚启动时为空 */
   timeline?: GenerationTimelineItem[] | null
   /** 当前仍在等待用户决议的审批请求（刷新后恢复审批卡片） */
@@ -166,11 +176,13 @@ export type ChatEvent =
       content: string
       agentName: string
       toolName: string | null
+      /** 运行开始时间（epoch 毫秒） */
+      startedAt?: number | null
       timeline?: GenerationTimelineItem[] | null
       /** 当前仍在等待决议的审批请求（快照恢复审批卡片） */
       pendingApprovals?: ApprovalRequestInfo[] | null
     }
-  | { type: 'run_start'; runId: string; seq: number; agentName: string }
+  | { type: 'run_start'; runId: string; seq: number; agentName: string; startedAt?: number }
   | {
       type: 'model_request_start'
       runId: string
@@ -182,6 +194,15 @@ export type ChatEvent =
     }
   | {
       type: 'text_delta'
+      runId: string
+      seq: number
+      round: number
+      callId: string
+      text: string
+    }
+  | {
+      /** 思考增量（推理模型的 reasoning_content / reasoning）；仅展示，不保存进回复正文 */
+      type: 'reasoning_delta'
       runId: string
       seq: number
       round: number

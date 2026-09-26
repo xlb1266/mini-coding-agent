@@ -1,15 +1,20 @@
 <script setup lang="ts">
-/** 工具执行过程卡片：收起时只有状态与摘要，展开后看整理后的参数与结果。
+/** 工具调用子卡片：收起时是“类型徽标 + 动作前缀 + 主参数 pill + 状态图标”一行，
+ * 点击才展开调用参数与返回结果（模仿 coding agent 轨迹区的卡片样式）。
  *
- * 状态同时使用图标与文字标注（不只靠颜色区分）；工具返回内容按不可信
- * 文本处理，全部走文本插值。展开/收起时向父级发 toggle 事件，由父级
+ * 状态给出图标与文字提示（aria-label / title，不只靠颜色）；工具返回内容按
+ * 不可信文本处理，全部走文本插值。展开/收起时向父级发 toggle 事件，由父级
  * 调整滚动位置，避免阅读跳动。
  */
 import { computed, ref } from 'vue'
 
 import type { ToolActivity, ToolActivityStatus } from '../stores/chat'
-import { toolDisplayTitle } from '../stores/chat'
-import { argumentEntries, formatResultText, RESULT_PREVIEW_LIMIT } from '../views/chat-format'
+import {
+  formatResultText,
+  RESULT_PREVIEW_LIMIT,
+  toolAction,
+  toolRowText,
+} from '../views/chat-format'
 
 const props = defineProps<{ tool: ToolActivity }>()
 const emit = defineEmits<{ (e: 'toggle', card: HTMLElement): void }>()
@@ -35,7 +40,9 @@ const typeLabel = computed(() => {
   return '工具'
 })
 
-const title = computed(() => toolDisplayTitle(props.tool))
+const action = computed(() => toolAction(props.tool))
+
+const rowText = computed(() => toolRowText(props.tool))
 
 const durationText = computed(() => {
   if (props.tool.durationMs === undefined) return ''
@@ -44,7 +51,13 @@ const durationText = computed(() => {
     : `${props.tool.durationMs}ms`
 })
 
-const args = computed(() => argumentEntries(props.tool.arguments))
+/** 调用参数按原始 JSON 展示；参数不是合法对象时为 null（给出说明文字）。 */
+const argumentsJson = computed(() => {
+  const args = props.tool.arguments
+  if (!args) return null
+  if (Object.keys(args).length === 0) return '{}'
+  return JSON.stringify(args, null, 2)
+})
 
 const resultText = computed(() => (props.tool.result ? formatResultText(props.tool.result.text) : ''))
 
@@ -65,31 +78,32 @@ function toggle(): void {
 
 <template>
   <div ref="rootEl" class="tool-card" :class="`is-${tool.status}`">
-    <button class="tool-card-head" type="button" :aria-expanded="expanded" @click="toggle">
-      <span class="tool-status-icon" :aria-label="statusMeta.label">{{ statusMeta.icon }}</span>
-      <span class="tool-card-title">
-        <span class="tool-name">{{ title }}</span>
-        <span class="tool-type">{{ typeLabel }}</span>
+    <button
+      class="tool-card-head"
+      type="button"
+      :aria-expanded="expanded"
+      :aria-label="`${action.prefix}${rowText ?? ''}（${statusMeta.label}）`"
+      @click="toggle"
+    >
+      <span class="tool-badge" :class="`is-${action.badgeTone}`" :title="typeLabel" aria-hidden="true">
+        {{ action.badgeLabel }}
       </span>
-      <span class="tool-state">
-        {{ statusMeta.label }}<template v-if="durationText"> · {{ durationText }}</template>
+      <span class="tool-prefix">{{ action.prefix }}</span>
+      <span v-if="rowText" class="tool-pill" :title="rowText">{{ rowText }}</span>
+      <span class="tool-status" :title="statusMeta.label">
+        <span class="tool-status-icon" :aria-label="statusMeta.label">{{ statusMeta.icon }}</span>
+        <span v-if="durationText" class="tool-duration">{{ durationText }}</span>
       </span>
-      <span class="tool-chevron" :class="{ 'is-open': expanded }" aria-hidden="true">▾</span>
+      <span class="tool-chevron" :class="{ 'is-open': expanded }" aria-hidden="true">›</span>
     </button>
-    <p v-if="!expanded && tool.summary" class="tool-summary">{{ tool.summary }}</p>
     <div v-if="expanded" class="tool-card-body">
       <div class="tool-section">
-        <div class="tool-section-label">输入参数</div>
-        <div v-if="args.length" class="arg-list">
-          <div v-for="arg in args" :key="arg.key" class="arg-row">
-            <span class="arg-key">{{ arg.key }}</span>
-            <span class="arg-value">{{ arg.value }}</span>
-          </div>
-        </div>
+        <div class="tool-section-label">调用参数</div>
+        <pre v-if="argumentsJson" class="tool-code">{{ argumentsJson }}</pre>
         <p v-else class="tool-section-empty">参数不是合法的 JSON 对象，或本次调用没有参数</p>
       </div>
       <div v-if="resultText" class="tool-section">
-        <div class="tool-section-label">{{ tool.status === 'error' ? '失败原因' : '执行结果' }}</div>
+        <div class="tool-section-label">{{ tool.status === 'error' ? '失败原因' : '返回结果' }}</div>
         <pre class="tool-result">{{ resultPreview.text }}</pre>
         <p v-if="resultPreview.clipped" class="tool-note">
           已截断，共 {{ resultText.length }} 字符
@@ -109,7 +123,7 @@ function toggle(): void {
 
 <style scoped>
 .tool-card {
-  margin: 4px 0;
+  margin: 3px 0;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-hover);
@@ -122,7 +136,7 @@ function toggle(): void {
   align-items: center;
   gap: 6px;
   width: 100%;
-  padding: 5px 8px;
+  padding: 5px 7px;
   border: none;
   border-radius: 8px;
   background: none;
@@ -133,12 +147,67 @@ function toggle(): void {
   background: var(--bg-active);
 }
 
-.tool-status-icon {
+/* 类型徽标：文件类/accent 用主色底，小图标类用浅底 */
+.tool-badge {
+  display: inline-flex;
   flex-shrink: 0;
-  width: 14px;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: 4px;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.tool-badge.is-accent {
+  background: var(--accent);
+  color: var(--text-inverse);
+}
+
+.tool-badge.is-muted {
+  background: var(--bg-active);
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.tool-prefix {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+/* 主参数 pill：等宽字体，比卡片底色再深一档 */
+.tool-pill {
+  flex: 1;
+  overflow: hidden;
+  min-width: 0;
+  padding: 1px 7px;
+  border-radius: 5px;
+  background: var(--bg-active);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-status {
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 4px;
+  align-items: center;
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+}
+
+.tool-status-icon {
   color: var(--text-secondary);
   font-size: 11px;
-  text-align: center;
 }
 
 .tool-card.is-success .tool-status-icon {
@@ -159,6 +228,12 @@ function toggle(): void {
   color: var(--warning);
 }
 
+.tool-card.is-error .tool-duration,
+.tool-card.is-cancelled .tool-duration,
+.tool-card.is-unknown .tool-duration {
+  color: var(--danger);
+}
+
 @keyframes tool-pulse {
   0%,
   100% {
@@ -170,73 +245,19 @@ function toggle(): void {
   }
 }
 
-.tool-card-title {
-  display: flex;
-  flex: 1;
-  align-items: baseline;
-  gap: 6px;
-  min-width: 0;
-}
-
-.tool-name {
-  overflow: hidden;
-  color: var(--text-primary);
-  font-size: 11.5px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tool-type {
-  flex-shrink: 0;
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--bg-surface);
-  color: var(--text-tertiary);
-  font-size: 10px;
-}
-
-.tool-state {
-  flex-shrink: 0;
-  color: var(--text-secondary);
-  font-size: 10.5px;
-}
-
-.tool-card.is-success .tool-state {
-  color: var(--success);
-}
-
-.tool-card.is-error .tool-state {
-  color: var(--danger);
-}
-
-.tool-card.is-cancelled .tool-state,
-.tool-card.is-unknown .tool-state {
-  color: var(--warning);
-}
-
 .tool-chevron {
   flex-shrink: 0;
   color: var(--text-tertiary);
-  font-size: 10px;
+  font-size: 11px;
   transition: transform 0.15s ease;
 }
 
 .tool-chevron.is-open {
-  transform: rotate(180deg);
-}
-
-.tool-summary {
-  overflow: hidden;
-  padding: 0 8px 5px 28px;
-  color: var(--text-secondary);
-  font-size: 10.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  transform: rotate(90deg);
 }
 
 .tool-card-body {
-  padding: 2px 8px 8px 28px;
+  padding: 2px 8px 8px;
   border-top: 1px dashed var(--border);
 }
 
@@ -256,34 +277,7 @@ function toggle(): void {
   font-size: 10.5px;
 }
 
-.arg-list {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.arg-row {
-  display: grid;
-  grid-template-columns: minmax(60px, max-content) 1fr;
-  gap: 8px;
-}
-
-.arg-key {
-  color: var(--text-secondary);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  overflow-wrap: anywhere;
-}
-
-.arg-value {
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
+.tool-code,
 .tool-result {
   max-height: 320px;
   margin: 0;

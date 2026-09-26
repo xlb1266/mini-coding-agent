@@ -14,7 +14,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.services import model_client
-from app.services.chat_generation import generation_manager, make_session_title
+from datetime import datetime
+
+from app.db.models.chat import ChatMessage
+from app.services.chat_generation import (
+    generation_manager,
+    make_session_title,
+    message_event_payload,
+    message_to_out,
+)
 
 API_KEY = "sk-test-123456"
 
@@ -90,6 +98,10 @@ def sse_chunk(payload: dict) -> bytes:
 
 def delta_chunk(text: str) -> bytes:
     return sse_chunk({"choices": [{"delta": {"content": text}}]})
+
+
+def reasoning_chunk(text: str) -> bytes:
+    return sse_chunk({"choices": [{"delta": {"reasoning_content": text}}]})
 
 
 DONE_CHUNK = b"data: [DONE]\n\n"
@@ -1061,6 +1073,120 @@ class TestRuntimeToolLoop:
         assert events[-1]["status"] == "completed"
         assert events[-1]["message"]["content"] == "先查时间：现在是北京时间，吃了吗"
 
+    def test_reasoning_timeline_and_saved_content(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, seeded_tools
+    ) -> None:
+        """思考增量进入展示时间线（思考卡片可恢复），但保存的回复正文不包含思考。"""
+        model = create_model(client)
+        agent = create_agent(client, model["id"], toolKeys=["builtin_current_time"])
+        session = create_session(client, agent_id=agent["id"])
+        transport = MultiResponseTransport(
+            [
+                [
+                    reasoning_chunk("用户在问时间，"),
+                    reasoning_chunk("需要调用工具查询。"),
+                    delta_chunk("先查时间："),
+                    tool_call_chunk("call_1", "builtin_current_time", '{"timezone": "Asia/Shanghai"}'),
+                    finish_chunk("tool_calls"),
+                    DONE_CHUNK,
+                ],
+                [reasoning_chunk("拿到结果，组织回答。"), delta_chunk("现在是北京时间"), DONE_CHUNK],
+            ],
+            delay=0.05,
+        )
+
+        def factory(timeout: float) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=transport, timeout=timeout)
+
+        monkeypatch.setattr(model_client, "_create_async_client", factory)
+
+        assert send_message(client, session["id"], "现在几点").status_code == 201
+        # 等工具卡片进入时间线后再订阅：快照应带回思考段及其顺序
+        wait_for(
+            client,
+            session["id"],
+            lambda data: any(
+                item.get("kind") == "tool" for item in (data.get("generation") or {}).get("timeline", [])
+            ),
+            what="时间线出现工具卡片",
+        )
+        events = collect_events(client, session["id"])
+
+        snapshot = events[0]
+        assert snapshot["type"] == "snapshot"
+        kinds = [item["kind"] for item in snapshot["timeline"]]
+        assert kinds[:3] == ["reasoning", "text", "tool"]
+        assert all(kind in ("reasoning", "text", "tool") for kind in kinds)
+        reasoning_item = snapshot["timeline"][0]
+        # 相邻思考增量合并为一段；工具开始时收起并补上耗时
+        assert reasoning_item["text"] == "用户在问时间，需要调用工具查询。"
+        assert isinstance(reasoning_item.get("durationMs"), int)
+        # 订阅后继续实时收到第二轮的思考增量
+        assert any(e["type"] == "reasoning_delta" and "拿到结果" in e["text"] for e in events)
+
+        data = wait_generation_done(client, session["id"])
+        # 思考内容只做展示，不进入保存的回复正文
+        assert data["messages"][1]["content"] == "先查时间：现在是北京时间"
+        assert events[-1]["type"] == "run_end"
+        assert events[-1]["status"] == "completed"
+
+    def test_saved_message_keeps_timeline_for_refresh(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, seeded_tools
+    ) -> None:
+        """轨迹随回复入库：刷新页面后重新拉 /messages 仍能拿到思考段与工具卡片。"""
+        model = create_model(client)
+        agent = create_agent(client, model["id"], toolKeys=["builtin_current_time"])
+        session = create_session(client, agent_id=agent["id"])
+        transport = MultiResponseTransport(
+            [
+                [
+                    reasoning_chunk("用户在问时间，"),
+                    reasoning_chunk("需要调用工具查询。"),
+                    delta_chunk("先查时间："),
+                    tool_call_chunk("call_1", "builtin_current_time", '{"timezone": "Asia/Shanghai"}'),
+                    finish_chunk("tool_calls"),
+                    DONE_CHUNK,
+                ],
+                [reasoning_chunk("拿到结果，组织回答。"), delta_chunk("现在是北京时间"), DONE_CHUNK],
+            ],
+            delay=0.02,
+        )
+
+        def factory(timeout: float) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=transport, timeout=timeout)
+
+        monkeypatch.setattr(model_client, "_create_async_client", factory)
+
+        assert send_message(client, session["id"], "现在几点").status_code == 201
+        data = wait_generation_done(client, session["id"])
+
+        # 已结束的运行不再有内存时间线，轨迹只能来自入库的消息
+        assert (data.get("generation") or None) is None
+        reply = data["messages"][1]
+        timeline = reply["timeline"]
+        assert [item["kind"] for item in timeline] == ["reasoning", "text", "tool", "reasoning", "text"]
+        assert timeline[0]["text"] == "用户在问时间，需要调用工具查询。"
+        assert isinstance(timeline[0]["durationMs"], int)
+        tool_item = timeline[2]
+        assert tool_item["callId"] == "call_1"
+        assert tool_item["displayName"] == "当前时间"
+        assert tool_item["status"] == "success"
+        assert tool_item["arguments"] == {"timezone": "Asia/Shanghai"}
+
+    def test_message_without_trace_has_no_timeline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """纯文字回复不写入轨迹（timeline 为 null），不影响原有读取。"""
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+        install_stream(monkeypatch, StreamTransport(chunks=[delta_chunk("好的"), DONE_CHUNK]))
+
+        assert send_message(client, session["id"], "你好").status_code == 201
+        data = wait_generation_done(client, session["id"])
+
+        assert data["messages"][1]["timeline"] is None
+        assert data["messages"][0]["timeline"] is None
+
 
 class TestContextCompaction:
     """阶段十：会话摘要过滤、发送前容量校验与压缩结果持久化。"""
@@ -1183,3 +1309,46 @@ class TestContextCompaction:
         assert any(c.startswith("第5条消息") for c in contents)
         assert "最后一问" in contents
         assert not any(c.startswith("第1条消息") for c in contents)
+
+
+class TestMessagePayload:
+    """消息输出模型：轨迹随消息返回，但终态事件里不带轨迹。"""
+
+    def _message(self, timeline_json: str | None) -> ChatMessage:
+        message = ChatMessage(
+            session_id=1,
+            role="assistant",
+            content="先查时间：现在是北京时间",
+            agent_id=1,
+            agent_name="测试助手",
+            status="completed",
+            seq=2,
+            created_at=datetime(2026, 9, 24, 10, 0, 0),
+            timeline_json=timeline_json,
+        )
+        message.id = 7
+        return message
+
+    def test_message_out_parses_stored_timeline(self) -> None:
+        timeline = [
+            {"kind": "reasoning", "text": "先想一下", "durationMs": 900},
+            {"kind": "text", "text": "先查时间："},
+            {"kind": "tool", "callId": "call_1", "status": "success"},
+        ]
+        out = message_to_out(self._message(json.dumps(timeline, ensure_ascii=False)))
+
+        assert out.timeline == timeline
+
+    def test_broken_or_missing_timeline_falls_back_to_none(self) -> None:
+        assert message_to_out(self._message(None)).timeline is None
+        assert message_to_out(self._message("{不是合法 JSON")).timeline is None
+        assert message_to_out(self._message("[]")).timeline is None
+
+    def test_event_payload_omits_timeline(self) -> None:
+        message = self._message(json.dumps([{"kind": "tool", "callId": "call_1"}]))
+
+        payload = message_event_payload(message)
+
+        assert "timeline" not in payload
+        assert payload["content"] == "先查时间：现在是北京时间"
+        assert payload["sessionId"] == 1

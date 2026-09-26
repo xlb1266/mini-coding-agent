@@ -42,7 +42,11 @@ class ChatSendRequest(CamelModel):
 
 
 class ChatMessageOut(CamelModel):
-    """一条聊天消息；assistant 消息带生成时的 Agent 快照。"""
+    """一条聊天消息；assistant 消息带生成时的 Agent 快照与过程轨迹。
+
+    timeline 为该次回复的展示轨迹（正文段 / 思考段 / 工具卡片段按事件顺序
+    交错）；纯文字回复为 None。只用于渲染，不参与模型上下文。
+    """
 
     id: int
     session_id: int
@@ -53,6 +57,7 @@ class ChatMessageOut(CamelModel):
     agent_name: str | None = None
     seq: int
     created_at: datetime
+    timeline: list[dict[str, Any]] | None = None
 
     @field_serializer("created_at")
     def serialize_datetime(self, value: datetime) -> str:
@@ -83,7 +88,7 @@ class ChatSessionOut(CamelModel):
 class ChatGenerationOut(CamelModel):
     """当前会话正在生成的状态快照（thinking 尚无正文，generating 有部分正文，tooling 工具执行中，approval 等待审批）。
 
-    timeline 为展示时间线（正文段与工具/审批/压缩卡片段按事件顺序交错），
+    timeline 为展示时间线（正文段与思考/工具/审批/压缩卡片段按事件顺序交错），
     供前端恢复卡片与消息顺序；运行刚启动或无内容时为空列表。
     pendingApprovals 为当前仍在等待用户决议的审批请求（刷新后恢复展示）。
     """
@@ -93,6 +98,8 @@ class ChatGenerationOut(CamelModel):
     agent_name: str
     # 正在执行的工具展示名（仅 tooling 阶段）
     tool_name: str | None = None
+    # 运行开始时间（epoch 毫秒）：展示“处理中 Xs”，刷新后仍准确
+    started_at: int | None = None
     timeline: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
 

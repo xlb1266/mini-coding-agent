@@ -15,7 +15,13 @@ import {
   type ChatSessionSummary,
 } from '../../api/chat'
 import { segmentsText, useChatStore } from '../chat'
-import type { ApprovalSegment, GenerationSegment, RunningGeneration, ToolSegment } from '../chat'
+import type {
+  ApprovalSegment,
+  GenerationSegment,
+  ReasoningSegment,
+  RunningGeneration,
+  ToolSegment,
+} from '../chat'
 
 vi.mock('../../api/chat', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/chat')>()
@@ -66,6 +72,8 @@ function makeGeneration(overrides: Partial<RunningGeneration> = {}): RunningGene
     phase: 'thinking',
     agentName: '测试助手',
     toolName: null,
+    startedAt: null,
+    reasoningStartedAt: null,
     segments: [],
     ...overrides,
   }
@@ -251,6 +259,34 @@ describe('chat store 发送与流式事件', () => {
     store.upsertMessage(reply)
 
     expect(store.messagesBySession[1]).toHaveLength(1)
+  })
+
+  it('reasoning_delta 逐段合并进思考段，不拼进正文', async () => {
+    await setupActiveSession()
+    const store = useChatStore()
+    vi.mocked(sendChatMessage).mockResolvedValue({
+      session: makeSession({ isGenerating: true }),
+      userMessage: makeMessage(),
+      generation: { phase: 'thinking', content: '', agentName: '测试助手' },
+    })
+    await store.sendMessage('现在几点')
+
+    emitEvent({ type: 'reasoning_delta', runId: 'r1', seq: 1, round: 1, callId: 'mr-1', text: '用户在问时间，' })
+    emitEvent({ type: 'reasoning_delta', runId: 'r1', seq: 2, round: 1, callId: 'mr-1', text: '需要调用工具。' })
+    emitEvent({ type: 'text_delta', runId: 'r1', seq: 3, round: 1, callId: 'mr-1', text: '先查时间：' })
+    emitEvent(toolStartEvent())
+    emitEvent(toolEndEvent())
+    // 工具之后的下一轮思考单独成段，不与上一轮合并
+    emitEvent({ type: 'reasoning_delta', runId: 'r1', seq: 6, round: 2, callId: 'mr-2', text: '拿到结果了' })
+
+    const segments = store.generations[1]!.segments
+    expect(segments.map((segment) => segment.kind)).toEqual(['reasoning', 'text', 'tool', 'reasoning'])
+    expect((segments[0] as ReasoningSegment).text).toBe('用户在问时间，需要调用工具。')
+    expect((segments[3] as ReasoningSegment).text).toBe('拿到结果了')
+    // 思考不进入正文：segmentsText 只取正文段
+    expect(segmentsText(segments)).toBe('先查时间：')
+    // 第一段思考在正文到达时收起并补上耗时（本地计时）
+    expect(typeof (segments[0] as ReasoningSegment).durationMs).toBe('number')
   })
 
   it('run_end 错误态记录原因；已保存的未完成回复进入消息列表', async () => {
@@ -598,6 +634,30 @@ describe('chat store 快照恢复', () => {
     expect(store.generations[1]!.segments).toEqual([{ kind: 'text', text: '只有正文' }])
   })
 
+  it('快照时间线中的思考段恢复为思考段（含耗时），不进入正文', () => {
+    const store = useChatStore()
+    store.generations[1] = makeGeneration()
+    store.subscribeEvents(1)
+
+    emitEvent({
+      type: 'snapshot',
+      runId: 'r1',
+      phase: 'thinking',
+      content: '',
+      agentName: '测试助手',
+      toolName: null,
+      timeline: [
+        { kind: 'reasoning', text: '正在思考问题。', durationMs: 900 },
+        { kind: 'text', text: '先查时间：' },
+      ],
+    })
+
+    const segments = store.generations[1]!.segments
+    expect(segments.map((segment) => segment.kind)).toEqual(['reasoning', 'text'])
+    expect((segments[0] as ReasoningSegment).durationMs).toBe(900)
+    expect(segmentsText(segments)).toBe('先查时间：')
+  })
+
   it('旧运行的迟到事件不落入当前时间线', () => {
     const store = useChatStore()
     store.generations[1] = makeGeneration({ runId: 'run-new' })
@@ -607,6 +667,89 @@ describe('chat store 快照恢复', () => {
     emitEvent({ type: 'text_delta', runId: 'run-old', seq: 2, round: 1, callId: 'mr-1', text: '旧正文' })
 
     expect(store.generations[1]!.segments).toEqual([])
+  })
+})
+
+describe('chat store 刷新后恢复轨迹', () => {
+  it('loadMessages 用消息自带的 timeline 恢复思考行与工具卡片', async () => {
+    const session = makeSession()
+    const reply = makeMessage({
+      id: 2,
+      role: 'assistant',
+      content: '先查时间：现在是北京时间',
+      agentId: 1,
+      agentName: '测试助手',
+      seq: 2,
+      timeline: [
+        { kind: 'reasoning', text: '需要调用工具查询。', durationMs: 900 },
+        { kind: 'text', text: '先查时间：' },
+        {
+          kind: 'tool',
+          callId: 'call_1',
+          toolName: 'builtin_current_time',
+          toolType: 'builtin',
+          displayName: '当前时间',
+          serverName: null,
+          status: 'success',
+          durationMs: 5,
+          arguments: { timezone: 'Asia/Shanghai' },
+        },
+        { kind: 'text', text: '现在是北京时间' },
+      ],
+    })
+    vi.mocked(listChatSessions).mockResolvedValue([session])
+    vi.mocked(getChatMessages).mockResolvedValue({
+      session,
+      messages: [makeMessage(), reply],
+      generation: null,
+    })
+
+    const store = useChatStore()
+    await store.fetchSessions()
+    await store.selectSession(1)
+
+    const segments = store.toolTimelines[2]
+    expect(segments?.map((segment) => segment.kind)).toEqual(['reasoning', 'text', 'tool', 'text'])
+    expect((segments![0] as ReasoningSegment).durationMs).toBe(900)
+    expect(segmentsText(segments!)).toBe('先查时间：现在是北京时间')
+    // 纯文字消息不产生卡片
+    expect(store.toolTimelines[1]).toBeUndefined()
+  })
+
+  it('消息没有 timeline 时不留卡片（纯文字回复）', async () => {
+    const session = makeSession()
+    vi.mocked(listChatSessions).mockResolvedValue([session])
+    vi.mocked(getChatMessages).mockResolvedValue({
+      session,
+      messages: [makeMessage(), makeMessage({ id: 2, role: 'assistant', content: '好的', seq: 2 })],
+      generation: null,
+    })
+
+    const store = useChatStore()
+    await store.fetchSessions()
+    await store.selectSession(1)
+
+    expect(store.toolTimelines).toEqual({})
+  })
+
+  it('本地已有实时时间线时不覆盖（同一次运行内的内存轨迹更完整）', () => {
+    const store = useChatStore()
+    const live = makeGeneration({
+      segments: [{ kind: 'text', text: '内存里的正文' }],
+    })
+    store.toolTimelines[2] = live.segments
+
+    store.seedTimelines([
+      makeMessage({
+        id: 2,
+        role: 'assistant',
+        content: '库里的正文',
+        seq: 2,
+        timeline: [{ kind: 'text', text: '库里的正文' }],
+      }),
+    ])
+
+    expect(segmentsText(store.toolTimelines[2]!)).toBe('内存里的正文')
   })
 })
 

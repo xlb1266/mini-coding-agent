@@ -337,6 +337,26 @@ async def test_stream_yields_deltas_in_order_and_sends_expected_request() -> Non
 
 
 @pytest.mark.anyio
+async def test_stream_yields_reasoning_deltas_in_order() -> None:
+    # 思考增量兼容两种上游字段名：reasoning_content（DeepSeek 风格）与 reasoning
+    transport = StreamTransport(
+        [
+            sse_line({"choices": [{"delta": {"reasoning_content": "先想"}}]}),
+            sse_line({"choices": [{"delta": {"reasoning": "一想"}}]}),
+            delta_line("回答"),
+            DONE_LINE,
+        ]
+    )
+
+    events = await run_stream(transport)
+
+    assert [event["type"] for event in events] == ["reasoning", "reasoning", "text", "finish"]
+    reasoning = "".join(event["text"] for event in events if event["type"] == "reasoning")
+    assert reasoning == "先想一想"
+    assert text_of(events) == "回答"
+
+
+@pytest.mark.anyio
 async def test_stream_accumulates_tool_calls_and_usage() -> None:
     transport = StreamTransport(
         [

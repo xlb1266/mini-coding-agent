@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import PageHeader from '../components/PageHeader.vue'
 import ApprovalCard from '../components/ApprovalCard.vue'
 import CompactionCard from '../components/CompactionCard.vue'
 import MarkdownContent from '../components/MarkdownContent.vue'
-import ToolCallCard from '../components/ToolCallCard.vue'
+import ThinkingCard from '../components/ThinkingCard.vue'
+import ToolGroupCard from '../components/ToolGroupCard.vue'
 import { useAgentsStore } from '../stores/agents'
 import { segmentsText, useChatStore } from '../stores/chat'
 import type { GenerationSegment } from '../stores/chat'
+import { buildDisplayItems } from './chat-format'
+import type { ChatDisplayItem } from './chat-format'
 import type { ChatMessage } from '../api/chat'
 
 const agentsStore = useAgentsStore()
@@ -210,9 +213,56 @@ function timelineFor(message: ChatMessage): GenerationSegment[] | null {
   return chatStore.toolTimelines[message.id] ?? null
 }
 
-const orphanSegments = computed(() =>
-  session.value ? chatStore.orphanSegments[session.value.id] ?? [] : [],
+/** 已结束回复的展示项：连续工具合并成“使用N个工具”组，默认全部收起。 */
+function timelineItems(message: ChatMessage): ChatDisplayItem[] {
+  return buildDisplayItems(timelineFor(message) ?? [])
+}
+
+const orphanItems = computed(() =>
+  buildDisplayItems(session.value ? chatStore.orphanSegments[session.value.id] ?? [] : []),
 )
+
+const generationItems = computed(() => buildDisplayItems(generation.value?.segments ?? []))
+
+/** 末项是思考项：思考仍在流式生成，由思考行自己表达“思考中”。 */
+const reasoningStreaming = computed(() => {
+  const items = generationItems.value
+  const last = items[items.length - 1]
+  return last !== undefined && last.kind === 'reasoning'
+})
+
+// ---- 运行计时（“处理中 1m 52s”） ----
+
+const nowMs = ref(Date.now())
+let clockTimer: number | undefined
+
+onMounted(() => {
+  clockTimer = window.setInterval(() => {
+    nowMs.value = Date.now()
+  }, 1000)
+})
+
+onUnmounted(() => {
+  if (clockTimer !== undefined) window.clearInterval(clockTimer)
+})
+
+/** 运行耗时文本：秒级用“12s”，分钟级用“1m 52s”，小时级用“1h 5m”。 */
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  if (minutes < 60) return `${minutes}m ${totalSeconds % 60}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+const elapsedText = computed(() => {
+  const startedAt = generation.value?.startedAt
+  if (startedAt === undefined || startedAt === null) return ''
+  return formatElapsed(nowMs.value - startedAt)
+})
+
+/** 运行状态行文本：“处理中 1m 52s”。 */
+const runStatusText = computed(() => (elapsedText.value ? `处理中 ${elapsedText.value}` : '处理中'))
 
 const phaseLabel = computed(() => {
   const phase = generation.value?.phase
@@ -339,17 +389,22 @@ function formatSessionTime(iso: string): string {
                   <span class="bubble-agent">{{ message.agentName ?? 'Agent' }}</span>
                   <span v-if="message.status === 'incomplete'" class="bubble-status">未完成</span>
                 </div>
-                <!-- 带时间线的回复：正文、工具卡片与压缩卡片按事件顺序交错展示 -->
+                <!-- 带时间线的回复：正文、思考行与工具组按事件顺序交错展示 -->
                 <template v-if="message.role === 'assistant' && timelineFor(message)">
-                  <template v-for="(segment, index) in timelineFor(message)" :key="index">
-                    <MarkdownContent v-if="segment.kind === 'text'" :text="segment.text" />
-                    <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
-                    <ApprovalCard
-                      v-else-if="segment.kind === 'approval'"
-                      :approval="segment.approval"
-                      @decide="(approved) => handleDecide(segment.approval.requestId, approved)"
+                  <template v-for="item in timelineItems(message)" :key="item.key">
+                    <MarkdownContent v-if="item.kind === 'text'" :text="item.text" />
+                    <ThinkingCard v-else-if="item.kind === 'reasoning'" :reasoning="item.reasoning" />
+                    <ToolGroupCard
+                      v-else-if="item.kind === 'toolGroup'"
+                      :tools="item.tools"
+                      @toggle="handleCardToggle"
                     />
-                    <CompactionCard v-else :compact="segment.compact" />
+                    <ApprovalCard
+                      v-else-if="item.kind === 'approval'"
+                      :approval="item.approval"
+                      @decide="(approved) => handleDecide(item.approval.requestId, approved)"
+                    />
+                    <CompactionCard v-else :compact="item.compact" />
                   </template>
                 </template>
                 <MarkdownContent v-else-if="message.role === 'assistant'" :text="message.content" />
@@ -358,21 +413,22 @@ function formatSessionTime(iso: string): string {
               </div>
             </div>
 
-            <!-- 无保存消息的收尾运行（取消且无正文等）留下的工具/压缩卡片 -->
-            <div v-if="orphanSegments.length" class="message-row is-assistant">
+            <!-- 无保存消息的收尾运行（取消且无正文等）留下的思考/工具卡片 -->
+            <div v-if="orphanItems.length" class="message-row is-assistant">
               <div class="tool-orphan">
-                <template v-for="(segment, index) in orphanSegments" :key="index">
-                  <ToolCallCard
-                    v-if="segment.kind === 'tool'"
-                    :tool="segment.tool"
+                <template v-for="item in orphanItems" :key="item.key">
+                  <ThinkingCard v-if="item.kind === 'reasoning'" :reasoning="item.reasoning" />
+                  <ToolGroupCard
+                    v-else-if="item.kind === 'toolGroup'"
+                    :tools="item.tools"
                     @toggle="handleCardToggle"
                   />
                   <ApprovalCard
-                    v-else-if="segment.kind === 'approval'"
-                    :approval="segment.approval"
-                    @decide="(approved) => handleDecide(segment.approval.requestId, approved)"
+                    v-else-if="item.kind === 'approval'"
+                    :approval="item.approval"
+                    @decide="(approved) => handleDecide(item.approval.requestId, approved)"
                   />
-                  <CompactionCard v-else-if="segment.kind === 'compact'" :compact="segment.compact" />
+                  <CompactionCard v-else-if="item.kind === 'compact'" :compact="item.compact" />
                 </template>
               </div>
             </div>
@@ -381,23 +437,39 @@ function formatSessionTime(iso: string): string {
             <div v-if="generation" class="message-row is-assistant">
               <div class="message-bubble is-assistant is-streaming">
                 <div class="bubble-head">
+                  <span class="run-status">
+                    <span class="run-mark" aria-hidden="true">✦</span>{{ runStatusText }}
+                  </span>
                   <span class="bubble-agent">{{ generation.agentName }}</span>
                 </div>
-                <template v-for="(segment, index) in generation.segments" :key="index">
+                <template v-for="item in generationItems" :key="item.key">
                   <MarkdownContent
-                    v-if="segment.kind === 'text'"
-                    :text="segment.text"
-                    :cursor="generation.phase === 'generating' && index === generation.segments.length - 1"
+                    v-if="item.kind === 'text'"
+                    :text="item.text"
+                    :cursor="generation.phase === 'generating' && item.key === generationItems[generationItems.length - 1]?.key"
                   />
-                  <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
+                  <ThinkingCard
+                    v-else-if="item.kind === 'reasoning'"
+                    :reasoning="item.reasoning"
+                    :streaming="item.key === generationItems[generationItems.length - 1]?.key"
+                    @toggle="handleCardToggle"
+                  />
+                  <ToolGroupCard
+                    v-else-if="item.kind === 'toolGroup'"
+                    :tools="item.tools"
+                    @toggle="handleCardToggle"
+                  />
                   <ApprovalCard
-                    v-else-if="segment.kind === 'approval'"
-                    :approval="segment.approval"
-                    @decide="(approved) => handleDecide(segment.approval.requestId, approved)"
+                    v-else-if="item.kind === 'approval'"
+                    :approval="item.approval"
+                    @decide="(approved) => handleDecide(item.approval.requestId, approved)"
                   />
-                  <CompactionCard v-else :compact="segment.compact" />
+                  <CompactionCard v-else :compact="item.compact" />
                 </template>
-                <div v-if="generation.phase !== 'generating' && generation.phase !== 'approval'" class="bubble-content thinking">
+                <div
+                  v-if="generation.phase !== 'generating' && generation.phase !== 'approval' && !reasoningStreaming"
+                  class="bubble-content thinking"
+                >
                   <template v-if="generation.phase === 'tooling'">正在调用工具：{{ generation.toolName }}<span class="dots">…</span></template>
                   <template v-else-if="generation.phase === 'compacting'">正在压缩上下文<span class="dots">…</span></template>
                   <template v-else>正在思考<span class="dots">…</span></template>
@@ -690,10 +762,25 @@ function formatSessionTime(iso: string): string {
   margin-bottom: 3px;
 }
 
-.bubble-agent {
+/* 运行状态行（“处理中 1m 52s”）：与轨迹区的状态行一致 */
+.run-status {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
   color: var(--text-secondary);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 600;
+}
+
+.run-mark {
+  color: var(--accent);
+  font-size: 11px;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.bubble-agent {
+  color: var(--text-tertiary);
+  font-size: 10.5px;
 }
 
 .bubble-status {

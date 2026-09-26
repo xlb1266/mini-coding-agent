@@ -175,6 +175,7 @@ def get_messages(session_id: int, db: Session = Depends(get_db)) -> ChatMessages
             content=run.content,
             agent_name=run.agent_name,
             tool_name=run.tool_name,
+            started_at=run.started_at_ms or None,
             timeline=[dict(item) for item in run.timeline],
             pending_approvals=[
                 approval.payload()
@@ -334,10 +335,16 @@ async def send_message(
         require_approval=agent.require_approval,
     )
 
+    started_run = generation_manager.get_run(session_id)
     return ChatSendResultOut(
         session=_session_out(db, session),
         user_message=message_to_out(user_message),
-        generation=ChatGenerationOut(phase="thinking", content="", agent_name=agent.name),
+        generation=ChatGenerationOut(
+            phase="thinking",
+            content="",
+            agent_name=agent.name,
+            started_at=(started_run.started_at_ms if started_run is not None else None),
+        ),
     )
 
 

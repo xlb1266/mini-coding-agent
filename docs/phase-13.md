@@ -10,10 +10,11 @@
 
 原计划第三模块的「Coding 预设」（Agent 编辑页一键填入 coding 系统提示词模板与工具勾选）暂缓未实现，见文末后续项。
 
-## 数据结构（迁移 0011 / 0012）
+## 数据结构（迁移 0011 / 0012 / 0013）
 
 - `0011_add_agent_workspace`：agents 表加 `workspace_dir`（String(512)，默认空串 = 使用全局默认目录 `settings.tool_workspace_dir`）与 `require_approval`（Boolean，默认 False；本迁移只落列，审批逻辑由后续提交实现）；
 - `0012_add_coding_tools`：向 tools 表插入三个新内置工具的种子行；同时 `0005_create_tools` 固定为只插最初三个工具 key，防止注册表扩充后重放迁移时重复插入；
+- `0013_add_message_timeline`：chat_messages 加 `timeline_json`（Text，可空），保存回复的过程轨迹；纯文字回复为 NULL；
 - 保存校验：`workspace_dir` 留空合法；填写时必须是已存在的绝对路径目录，否则 422，且不会自动创建目录。前端 Agent 表单做对应校验并提供「选择目录」按钮。
 
 ## 工作区与目录选择
@@ -39,6 +40,19 @@
 - 黑名单与审批是两层独立防护：黑名单在执行层强制落实，被拦截的命令即使获得批准也不会执行；
 - 前端：聊天页审批卡片（工具名、参数、批准 / 拒绝按钮，点击后置灰防重复提交），打开会话时拉取挂起审批恢复展示；Agent 编辑表单增加「执行审批」开关。
 
+## 聊天轨迹展示（思考行与工具组卡片）
+
+聊天页的过程展示按 agent 轨迹区样式重做，**默认全部收起，点击标题行才展开**：
+
+- 运行状态行：生成中在气泡顶部显示「✦ 处理中 1m 52s」；开始时间由后端随 `run_start` 与重连快照（`startedAt`，epoch 毫秒）下发，刷新页面后仍准确；
+- 思考行：推理模型的思考内容（`reasoning_content` / `reasoning` 增量）默认只显示「✦ 思考 1s」一行，展开才看正文；思考只进展示时间线，不写入保存的回复正文，也不进入对话上下文；
+- 工具组卡片：「使用N个工具」把相邻的工具调用折叠成一组，展开后是逐次调用的子卡片；组内有失败 / 取消时在标题行用文字点明；
+- 子卡片：`类型徽标 + 动作前缀 + 主参数 pill + 状态图标 + 耗时`（如「TS 已读取：src/agent.ts」），展开看「调用参数」与「返回结果」；动作前缀按工具生成（已读取 / 已写入 / 已编辑 / 已列出 / 搜索文件 / 执行命令），文件类徽标取扩展名；
+- 分段规则：相邻工具合并成一组，正文、思考、审批、压缩卡片都会打断分组；审批与压缩卡片始终直接展示（审批需要用户操作）；
+- 轨迹随消息入库（迁移 0013 给 `chat_messages` 加 `timeline_json`）：运行结束时把展示轨迹与回复正文一起保存，**刷新页面或重新打开会话后思考行与工具卡片照常恢复**（仍默认收起）；纯文字回复不写轨迹（列为 NULL）。入库前先收尾（思考补耗时、未完成的工具标记取消/未知、待决议审批标记已取消），思考正文按 4000 字符截断，入库与下发同一口径脱敏。终态 SSE 事件的消息载荷不带轨迹（同一批事件已由运行记录保存，避免重复放大）；无保存消息的收尾运行仍只在页面内存保留卡片。
+
+后端新增事件 `reasoning_delta`（`model_client` 解析思考增量 → Runtime 转发 → `chat_generation` 合并进时间线并补耗时），逐条思考与正文增量一样不落库；状态与内容仍全部经过密钥脱敏后下发。
+
 ## 安全边界
 
 - 危险命令黑名单是尽力而为的拦截，不等于安全沙箱；需要强隔离时应把后端整体放进容器或受限账号运行；
@@ -49,6 +63,8 @@
 ## 测试
 
 后端：`tests/test_coding_tools.py`（三个新工具各场景）、`tests/test_system_api.py`（目录选择）、`tests/test_approvals.py`（审批流：批准 / 拒绝 / 超时 / 取消 / 评测不挂起）、`tests/test_approvals_api.py`（两端点正常与异常分支），以及 test_agent_runtime / test_agents_api / test_tool_executor / test_migrations 的相应扩展。前端：agent-form 新字段校验、chat store 审批事件处理、`ApprovalCard.spec.ts`。
+
+轨迹展示：`tests/test_model_client.py`（思考增量两种字段名）、`tests/test_chat_api.py`（思考进时间线、补耗时、不进保存正文、快照带 startedAt、轨迹随消息入库可在刷新后恢复、纯文字回复无轨迹、终态事件不带轨迹）；前端 `ThinkingCard.spec.ts`、`ToolGroupCard.spec.ts`、`ToolCallCard.spec.ts`、`chat-format.spec.ts`（分组与动作前缀）、`ChatView.spec.ts`（默认收起、处理中计时）、`chat.spec.ts`（思考流合并、刷新后按消息轨迹恢复）。
 
 已知 flaky：`tests/test_chat_api.py` 的 `test_full_compaction_flow_persists_summary` 在全量 pytest 下偶发失败（时序敏感），单跑稳定通过，与本阶段改动无关。
 

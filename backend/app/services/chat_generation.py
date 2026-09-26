@@ -15,6 +15,12 @@ SSE 事件（data 为 JSON，驼峰字段）：
 - {"type":"run_start","runId","seq","agentName"}     运行开始
 - {"type":"model_request_start"|"model_request_end"} 模型请求起止（callId 配对）
 - {"type":"text_delta","runId","seq","round","callId","text"}   正文增量
+- {"type":"reasoning_delta","runId","seq","round","callId","text"}
+                                                     思考增量（推理模型
+                                                     经 reasoning_content /
+                                                     reasoning 下发；仅进
+                                                     入展示时间线，不保存
+                                                     进回复正文）
 - {"type":"tool_call_start",...,"arguments","serverName"}
                                                      工具调用开始（含整理后参数）
 - {"type":"tool_call_end",...,"status","summary","result"}
@@ -49,7 +55,9 @@ run_end 的 status：completed（已完成并保存）/ cancelled（已停止，
 """
 
 import asyncio
+import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -81,6 +89,7 @@ from app.services.agent_runtime import (
     CONTEXT_COMPACTION_START,
     CONTEXT_TRIM,
     REASON_CANCELLED,
+    REASONING_DELTA,
     RUN_END,
     RUN_START,
     STATUS_CANCELLED,
@@ -113,6 +122,9 @@ PHASE_GENERATING = "generating"
 PHASE_TOOLING = "tooling"
 PHASE_COMPACTING = "compacting"
 PHASE_APPROVAL = "approval"
+
+# 轨迹里思考正文入库前的长度上限（与工具结果展示上限同量级）
+TIMELINE_REASONING_MAX_LENGTH = 4000
 
 # 终态事件类型
 EVENT_RUN_END = RUN_END
@@ -174,6 +186,7 @@ def estimate_context_tokens(system_prompt: str, history: list[ChatMessage], new_
 
 
 def message_to_out(message: ChatMessage) -> ChatMessageOut:
+    """消息转输出模型；assistant 消息带入库的过程轨迹（纯文字回复为 None）。"""
     return ChatMessageOut(
         id=message.id,
         session_id=message.session_id,
@@ -184,12 +197,33 @@ def message_to_out(message: ChatMessage) -> ChatMessageOut:
         agent_name=message.agent_name,
         seq=message.seq,
         created_at=message.created_at,
+        timeline=parse_stored_timeline(message.timeline_json),
     )
 
 
+def parse_stored_timeline(raw: str | None) -> list[dict[str, Any]] | None:
+    """解析入库的轨迹 JSON；缺失或损坏时返回 None（按纯文字回复展示）。"""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    items = [item for item in parsed if isinstance(item, dict)]
+    return items or None
+
+
 def message_event_payload(message: ChatMessage) -> dict[str, Any]:
-    """把已保存的消息转成 SSE 事件里使用的驼峰 JSON 字典。"""
-    return message_to_out(message).model_dump(by_alias=True, mode="json")
+    """把已保存的消息转成 SSE 事件里使用的驼峰 JSON 字典。
+
+    不带轨迹：同一批事件已由运行记录保存，重复下发只会放大载荷；页面渲染
+    用内存时间线，刷新后从 /messages 读取。
+    """
+    payload = message_to_out(message).model_dump(by_alias=True, mode="json")
+    payload.pop("timeline", None)
+    return payload
 
 
 def timeline_append_text(timeline: list[dict[str, Any]], text: str) -> None:
@@ -198,6 +232,67 @@ def timeline_append_text(timeline: list[dict[str, Any]], text: str) -> None:
         timeline[-1]["text"] += text
     else:
         timeline.append({"kind": "text", "text": text})
+
+
+def timeline_append_reasoning(run: "GenerationRun", text: str) -> None:
+    """思考增量并入时间线：与上一段思考相连时合并，否则新起一段。
+
+    思考只进展示时间线，不累计进 run.content（回复正文）。
+    """
+    timeline = run.timeline
+    if timeline and timeline[-1].get("kind") == "reasoning":
+        timeline[-1]["text"] += text
+    else:
+        timeline.append({"kind": "reasoning", "text": text})
+    if run.reasoning_started_mono is None:
+        run.reasoning_started_mono = time.monotonic()
+
+
+def timeline_close_reasoning(run: "GenerationRun") -> None:
+    """收起进行中的思考段：补上耗时，下一段思考重新计时。"""
+    started = run.reasoning_started_mono
+    if started is None:
+        return
+    run.reasoning_started_mono = None
+    if run.timeline and run.timeline[-1].get("kind") == "reasoning":
+        run.timeline[-1]["durationMs"] = int((time.monotonic() - started) * 1000)
+
+
+def finalize_timeline(run: "GenerationRun", status: str) -> None:
+    """运行结束时的轨迹收尾：不留“进行中”，与前端展示口径一致。
+
+    思考段补耗时；仍在执行的工具与压缩卡片按取消 / 状态未知收尾（与前端
+    settleGeneration 同一规则），等待决议的审批标记为已取消。
+    """
+    timeline_close_reasoning(run)
+    fallback = "cancelled" if status == STATUS_CANCELLED else "unknown"
+    for item in run.timeline:
+        kind = item.get("kind")
+        if kind == "tool" and item.get("status") == "running":
+            item["status"] = fallback
+        elif kind == "compact" and item.get("status") == "running":
+            item["status"] = fallback
+        elif kind == "approval" and item.get("status") == "pending":
+            item["status"] = "cancelled"
+
+
+def timeline_for_storage(run: "GenerationRun") -> str | None:
+    """把展示轨迹序列化入库；纯文字回复（没有过程轨迹）返回 None。
+
+    思考正文按展示上限截断，整段 JSON 再脱敏一次，保证入库内容与下发
+    内容是同一口径。轨迹只作展示，不参与模型上下文。
+    """
+    if not any(item.get("kind") != "text" for item in run.timeline):
+        return None
+    items: list[dict[str, Any]] = []
+    for item in run.timeline:
+        stored = dict(item)
+        if stored.get("kind") == "reasoning":
+            text = str(stored.get("text") or "")
+            if len(text) > TIMELINE_REASONING_MAX_LENGTH:
+                stored["text"] = text[:TIMELINE_REASONING_MAX_LENGTH] + "…（已截断）"
+        items.append(stored)
+    return redact(json.dumps(items, ensure_ascii=False), run.api_key)
 
 
 def timeline_update_tool(timeline: list[dict[str, Any]], event: dict[str, Any]) -> None:
@@ -296,11 +391,15 @@ class GenerationRun:
     require_approval: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     run_id: str | None = None
+    # 运行开始的墙上时间（epoch 毫秒）：展示“处理中 Xs”用，刷新后仍准确
+    started_at_ms: int = 0
     phase: str = PHASE_THINKING
     content: str = ""
     tool_name: str | None = None
     # 展示时间线：正文段与工具卡片段按事件顺序交错，重连快照用它恢复
     timeline: list[dict[str, Any]] = field(default_factory=list)
+    # 当前思考段的开始时刻（monotonic）；None 表示没有进行中的思考段
+    reasoning_started_mono: float | None = None
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     had_subscribers: bool = False
     finished: bool = False
@@ -373,6 +472,7 @@ class GenerationManager:
             session_summary=session_summary,
             summary_boundary=summary_boundary,
             require_approval=require_approval,
+            started_at_ms=int(time.time() * 1000),
         )
         recorder = RunRecorder(
             session_factory,
@@ -475,6 +575,8 @@ class GenerationManager:
             "content": run.content,
             "agentName": run.agent_name,
             "toolName": run.tool_name,
+            # 运行开始时间（epoch 毫秒）：前端展示“处理中 Xs”，刷新后仍准确
+            "startedAt": run.started_at_ms,
             "timeline": [dict(item) for item in run.timeline],
             # 当前仍在等待决议的审批请求：刷新 / 重新打开页面后恢复审批卡片
             "pendingApprovals": [
@@ -483,7 +585,7 @@ class GenerationManager:
         }
 
     def _save_assistant_message(self, run: GenerationRun, status: str) -> ChatMessage:
-        """任务自己的短数据库会话：保存回复正文并更新会话时间。"""
+        """任务自己的短数据库会话：保存回复正文与过程轨迹并更新会话时间。"""
         db: Session = run.session_factory()
         try:
             content = redact(run.content, run.api_key)
@@ -496,6 +598,8 @@ class GenerationManager:
                 status=status,
                 seq=next_seq(db, run.session_id),
                 created_at=utcnow(),
+                # 轨迹随消息入库：刷新页面后思考行与工具卡片照常恢复
+                timeline_json=timeline_for_storage(run),
             )
             db.add(message)
             session = db.get(ChatSession, run.session_id)
@@ -518,6 +622,9 @@ class GenerationManager:
         event_type = event.get("type")
         if event_type != RUN_END and run.recorder is not None:
             run.recorder.record_event(event)
+        # 思考段在第一个非思考事件到达时收起并补耗时（正文/工具/压缩等）
+        if event_type != REASONING_DELTA:
+            timeline_close_reasoning(run)
         if event_type == RUN_START:
             run.run_id = event.get("runId")
             self._broadcast(run, event)
@@ -527,6 +634,10 @@ class GenerationManager:
             timeline_append_text(run.timeline, event.get("text", ""))
             if run.phase != PHASE_GENERATING:
                 run.phase = PHASE_GENERATING
+            self._broadcast(run, event)
+            return
+        if event_type == REASONING_DELTA:
+            timeline_append_reasoning(run, event.get("text", ""))
             self._broadcast(run, event)
             return
         if event_type == TOOL_CALL_START:
@@ -602,6 +713,8 @@ class GenerationManager:
         status = event.get("status")
         final_event = dict(event)
         final_event.setdefault("message", None)
+        # 入库前先收尾轨迹：不留“执行中”的卡片，思考段补上耗时
+        finalize_timeline(run, str(status or ""))
 
         if run.content.strip():
             db_status = STATUS_COMPLETED if status == STATUS_COMPLETED else STATUS_INCOMPLETE

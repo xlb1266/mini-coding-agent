@@ -40,6 +40,7 @@ from app.db.models.run_record import (
 )
 from app.services.agent_runtime import (
     RUN_END,
+    REASONING_DELTA,
     TEXT_DELTA,
     TOOL_CALL_END,
     sanitize_display,
@@ -140,9 +141,9 @@ class RunRecorder:
     # ---- 事件 ----
 
     def record_event(self, event: dict[str, Any]) -> None:
-        """持久化一个运行事件（text_delta 除外）；重复 seq 直接跳过。"""
+        """持久化一个运行事件（正文/思考增量除外）；重复 seq 直接跳过。"""
         event_type = event.get("type")
-        if event_type == TEXT_DELTA or not self._enabled:
+        if event_type in (TEXT_DELTA, REASONING_DELTA) or not self._enabled:
             return
         seq = event.get("seq")
         if not isinstance(seq, int):

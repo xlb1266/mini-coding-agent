@@ -78,5 +78,8 @@ class ChatMessage(Base):
     # 会话内稳定顺序号，从 1 递增；读取按 (session_id, seq) 排序
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # 过程轨迹（正文段 / 思考段 / 工具卡片段交错）的 JSON；纯文字回复为 NULL。
+    # 只作展示用：刷新页面后据此恢复思考行与工具卡片，不参与模型上下文。
+    timeline_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     session: Mapped["ChatSession"] = relationship(back_populates="messages")

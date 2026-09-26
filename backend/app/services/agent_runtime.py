@@ -37,6 +37,8 @@ Runtime 不依赖前端页面、HTTP 请求对象或浏览器连接；取消信�
   结束事件带状态、耗时与上游实际返回的 Token 用量（未知则为 null）；
   摘要生成请求带 purpose=context_compaction，不占用执行轮数；
 - text_delta：正文增量（工具调用前后按序保留，进入下一轮不覆盖不清空）；
+- reasoning_delta：思考增量（推理模型经 reasoning_content / reasoning 下发，
+  仅用于前端展示思考卡片，不累计进回复正文，也不进入对话上下文）；
 - tool_call_start / tool_call_end：工具调用起止（含 Skill 加载，toolType
   标记 builtin / mcp / skill），用调用标识配对；开始事件带整理后的输入
   参数（脱敏、超长截断）与 MCP Server 名称，结束事件带状态（success /
@@ -128,6 +130,7 @@ logger = logging.getLogger(__name__)
 RUN_START = "run_start"
 MODEL_REQUEST_START = "model_request_start"
 TEXT_DELTA = "text_delta"
+REASONING_DELTA = "reasoning_delta"
 MODEL_REQUEST_END = "model_request_end"
 TOOL_CALL_START = "tool_call_start"
 TOOL_CALL_END = "tool_call_end"
@@ -1708,6 +1711,19 @@ class AgentRuntime:
                         state,
                         {"type": TEXT_DELTA, "round": round_no, "callId": call_id, "text": delta},
                     )
+                elif event["type"] == "reasoning":
+                    # 思考增量只做展示，不累计进回复正文与对话上下文
+                    reasoning_delta = redact(event["text"], config.api_key)
+                    if reasoning_delta:
+                        self._emit(
+                            state,
+                            {
+                                "type": REASONING_DELTA,
+                                "round": round_no,
+                                "callId": call_id,
+                                "text": reasoning_delta,
+                            },
+                        )
                 elif event["type"] == "finish":
                     calls = event.get("tool_calls")
                     if isinstance(calls, list):
