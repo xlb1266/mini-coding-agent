@@ -58,34 +58,31 @@ mini-coding-agent 是一个本地优先的 coding agent 工作台，由 mini-age
 | `npm run test` | Vitest 测试 |
 | `npm run build` | 类型检查 + 生产构建 |
 
-## 启动项目（手动验收）
+## 快速开始
 
-前后端各开一个终端，先启动后端再启动前端；验收完在对应终端按 `Ctrl + C` 停止。
+### 1. 启动后端（端口 8001，只监听本机）
 
-1. 清理端口残留（重要）：Windows 允许两个进程同时绑定 8000 端口且不报错，流量被分摊后页面会一直卡在"正在思考"。启动前先查占用（最后一列是 PID）：
+```bash
+cd backend
+uv sync                                          # 按 uv.lock 安装依赖到 .venv
+uv run alembic upgrade head                      # 建库并应用迁移（生成 backend/mini_agent.db）
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
+```
 
-   ```powershell
-   netstat -ano | findstr ":8000 :5173"   # 无输出即端口干净
-   taskkill /F /PID <PID>                 # 有残留就按 PID 杀掉
-   ```
+命令含义：`uv run` 在项目虚拟环境中执行命令；`uvicorn app.main:app` 指启动 `app/main.py` 里的 FastAPI 实例；`--host 127.0.0.1` 限制只监听本机；`--reload` 让代码修改后自动重启。
 
-   Git Bash 下杀进程写法为 `taskkill //F //PID <PID>`（斜杠加倍，防止被当成路径）。
+验证：访问 http://127.0.0.1:8000/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
 
-2. 启动后端（在 `backend/` 目录）：
+### 2. 启动前端（端口 5174）
 
-   ```bash
-   uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-   ```
+```bash
+cd frontend
+npm install                                      # 安装依赖
+npm run dev -- --port 5174                                 # 启动 Vite 开发服务
+```
 
-   `--host 127.0.0.1` 只监听本机；`--reload` 改代码自动重启。验证：访问 http://127.0.0.1:8000/api/health ，应返回 `{"status":"ok",...}`。
+打开 http://localhost:5174 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8000 端口的后端，业务代码不写死后端地址。
 
-3. 启动前端（另开终端，在 `frontend/` 目录）：
-
-   ```bash
-   npm run dev
-   ```
-
-   浏览器打开 http://localhost:5173 。注意 Vite 默认只监听 IPv6 的 localhost，用 `127.0.0.1:5173` 可能打不开；后端才是 `127.0.0.1:8000`。前端请求全部走相对路径 `/api`，由 Vite 代理转发到后端，无需其他配置。
 
 ## 硬性规则
 

@@ -29,7 +29,7 @@
 
 ## 快速开始
 
-### 1. 启动后端（端口 8000，只监听本机）
+### 1. 启动后端（端口 8001，只监听本机）
 
 ```bash
 cd backend
@@ -42,7 +42,7 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
 
 验证：访问 http://127.0.0.1:8000/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
 
-### 2. 启动前端（端口 5173）
+### 2. 启动前端（端口 5174）
 
 ```bash
 cd frontend
@@ -50,7 +50,7 @@ npm install                                      # 安装依赖
 npm run dev -- --port 5174                                 # 启动 Vite 开发服务
 ```
 
-打开 http://localhost:5173 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8000 端口的后端，业务代码不写死后端地址。
+打开 http://localhost:5174 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8000 端口的后端，业务代码不写死后端地址。
 
 ## 测试
 
