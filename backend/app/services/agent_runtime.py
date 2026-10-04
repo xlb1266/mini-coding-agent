@@ -69,6 +69,7 @@ from typing import Any, Awaitable, Callable
 
 from sqlalchemy.orm import sessionmaker
 
+from app.core.config import settings
 from app.core.secret_box import SecretBox, SecretBoxError
 from app.db.models.agent import (
     Agent,
@@ -120,6 +121,7 @@ from app.services.token_estimation import (
     estimate_messages_tokens,
     estimate_tokens,
 )
+from app.services.tools import shell_jobs
 from app.services.tools.base import ToolContext, ToolExecutionResult
 from app.services.tools.executor import execute_tool
 from app.services.tools.registry import get_definition
@@ -472,6 +474,16 @@ def _builtin_summary(key: str, data: dict[str, Any]) -> str:
     if key == "builtin_current_time":
         return f"{data.get('datetime', '')}（{data.get('timezone', '')}）"
     if key == "builtin_shell":
+        action = str(data.get("action") or "run")
+        if action == "list":
+            return f"列出后台任务，共 {data.get('totalJobs', 0)} 个"
+        if action == "stop":
+            return f"停止后台任务 {data.get('taskId', '')}：{data.get('status', '')}"
+        if data.get("taskId") and (data.get("autoBackgrounded") or action == "background"):
+            label = "后台启动" if action == "background" else "已自动转后台"
+            return f"{label}：{data.get('command', '')}（taskId {data.get('taskId')}，运行中）"
+        if data.get("timedOut"):
+            return f"命令超时被终止：{data.get('command', '')}"
         output = str(data.get("stdout") or data.get("stderr") or "").strip()
         summary = f"命令：{data.get('command', '')}，退出码 {data.get('exitCode')}"
         if output:
@@ -1136,6 +1148,8 @@ class AgentRuntime:
                 return self._finish(
                     state, status=STATUS_ERROR, reason=REASON_CONTEXT_OVERFLOW, error=overflow
                 )
+            # 容量管理之后、模型请求之前注入后台任务退出通知
+            self._inject_job_notifications(state, config, plan)
             messages = plan.request_messages()
             try:
                 turn_text, tool_calls, usage = await self._model_turn(
@@ -1210,6 +1224,37 @@ class AgentRuntime:
                 f"已达到最大执行轮数（{config.max_rounds} 轮），生成已停止",
                 "可在 Agent 管理中调大该 Agent 的最大执行轮数后重试",
             ),
+        )
+
+    def _inject_job_notifications(self, state: _RunState, config: _LoadedConfig, plan: _ContextPlan) -> None:
+        """后台任务退出通知：每轮模型调用前取走本工作区的待发通知并注入。
+
+        通知以 system 消息进入本轮请求上下文（不落聊天记录），模型无需
+        轮询即可知道后台服务崩没崩、退出码是多少。
+        """
+        tool_context = config.tool_context
+        workspace_root = (
+            tool_context.workspace_root if tool_context is not None else settings.tool_workspace_dir
+        )
+        notifications = shell_jobs.SHELL_JOBS.drain_notifications(workspace_root)
+        if not notifications:
+            return
+        lines = "\n".join(
+            f"- 任务 {item.get('taskId')}（{item.get('command')}）已退出，"
+            f"退出码 {item.get('exitCode')}；输出文件：{item.get('outputFile')}"
+            for item in notifications
+        )
+        plan.run_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "【后台任务通知】以下后台任务状态有变化，请结合当前任务目标"
+                    f"决定是否需要查看输出或重新处理：\n{lines}"
+                ),
+            }
+        )
+        logger.info(
+            "注入后台任务通知 run_id=%s count=%d", state.run_id, len(notifications)
         )
 
     # ---- 上下文容量管理 ----
@@ -1878,15 +1923,17 @@ class AgentRuntime:
     def tool_requires_approval(self, entry: _ToolEntry, arguments: dict[str, Any]) -> bool:
         """本次工具调用是否需要人工审批（模块二范围，黑名单之外的第二层）。
 
-        Shell 工具的任何命令（命令最难预判，不做安全白名单）、文件读写
-        工具的写入操作（覆盖 / 新建 / 追加）、edit_file 的全部操作需要
-        审批；读取、列目录、搜索、时间与 Skill 加载不需要。MCP 工具
+        Shell 工具按动作区分（阶段十四）：执行（run）、后台启动（background）
+        与停止任务（stop）涉及环境操作需要审批；查列表（list）只读不需要。
+        文件读写工具的写入操作（覆盖 / 新建 / 追加）、edit_file 的全部操作
+        需要审批；读取、列目录、搜索、时间与 Skill 加载不需要。MCP 工具
         本版不做审批。
         """
         if entry.tool_type != TOOL_TYPE_BUILTIN:
             return False
         if entry.ref_key == "builtin_shell":
-            return True
+            action = str(arguments.get("action") or "run").strip().lower()
+            return action != "list"
         if entry.ref_key == "builtin_file":
             return arguments.get("action") == "write"
         if entry.ref_key == "builtin_edit_file":

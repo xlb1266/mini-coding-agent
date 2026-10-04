@@ -14,9 +14,10 @@ settings.tool_workspace_dir（手动测试端点与旧调用方）。
 
 import difflib
 import fnmatch
-import locale
 import re
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,15 @@ from app.services.tools.base import (
     ToolContext,
     ToolExecutionError,
     ToolParamError,
-    ToolTimeoutError,
+    decode_output,
+)
+from app.services.tools.shell_jobs import (
+    SHELL_JOBS,
+    JobLogFile,
+    OutputCollector,
+    child_env,
+    drain_stream,
+    kill_tree,
 )
 
 _WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
@@ -234,48 +243,181 @@ def _normalize_target(target: str) -> str:
 
 
 def run_shell(params: dict, context: ToolContext | None = None) -> dict:
-    """执行 shell 命令，返回退出码与输出；危险命令、超时在这里被强制落实。
+    """Shell 工具统一入口：按 action 分流（run / background / stop / list）。
 
-    命令的工作目录（cwd）落在 context 指定的工作区根目录
-    （context 为 None 时用全局默认目录）。
+    危险命令黑名单对 run 与 background 照旧前置；前台执行的整树击杀、
+    阻塞预算保险丝与输出截断落盘在这里落实；后台任务托管见 shell_jobs。
     """
+    action = str(params.get("action") or "run").strip().lower()
+    if action not in _SHELL_ACTIONS:
+        raise ToolParamError(
+            "action 取值不合法",
+            fields={"action": "action 必须是 run（前台执行）、background（后台启动）、stop（停止任务）或 list（列任务）"},
+        )
+
+    workspace_root = _workspace_root(context)
+
+    if action == "list":
+        jobs = SHELL_JOBS.list(workspace_root)
+        return {"action": "list", "jobs": jobs, "totalJobs": len(jobs)}
+
+    if action == "stop":
+        task_id = str(params.get("taskId") or "").strip()
+        if not task_id:
+            raise ToolParamError("请填写要停止的任务 ID", fields={"taskId": "action=stop 时必须提供 taskId"})
+        return {"action": "stop", **SHELL_JOBS.stop(task_id, workspace_root)}
+
     command = str(params.get("command") or "").strip()
     if not command:
         raise ToolParamError("请填写要执行的命令", fields={"command": "命令不能为空"})
 
-    timeout = params.get("timeout", settings.tool_shell_timeout_seconds)
-    max_timeout = settings.tool_shell_timeout_max_seconds
-    if not 1 <= timeout <= max_timeout:
-        raise ToolParamError(
-            "超时时间超出允许范围",
-            fields={"timeout": f"超时时间须为 1–{max_timeout} 秒的整数"},
-        )
-
+    timeout = _resolve_shell_timeout(params.get("timeout"))
     assert_shell_command_allowed(command)
 
-    workspace_root = _workspace_root(context)
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            command, shell=True, capture_output=True, timeout=timeout, cwd=workspace_root
-        )
-    except subprocess.TimeoutExpired as expired:
-        partial = _decode(expired.stdout or b"").strip()
-        detail = f"，已产生的输出：{partial[:200]}" if partial else ""
-        raise ToolTimeoutError(f"命令执行超过 {timeout} 秒，已被终止{detail}") from None
+    if action == "background":
+        job = SHELL_JOBS.start(command, workspace_root)
+        return {
+            "action": "background",
+            **job.to_payload(),
+            "message": (
+                "命令已在后台启动，未被终止，也不会自动超时；稍后用文件读写工具"
+                f"读取输出文件确认进展（read 时可配 tailLines 只看末尾），"
+                "不需要时用 action=stop 并携带 taskId 停止。"
+            ),
+        }
 
-    duration_ms = int((time.monotonic() - started) * 1000)
-    stdout, stdout_clipped = _clip(_decode(completed.stdout or b""))
-    stderr, stderr_clipped = _clip(_decode(completed.stderr or b""))
-    return {
+    return _run_shell_foreground(command, timeout, workspace_root)
+
+
+# 本来就该一直等的命令不适合自动转后台（保险丝豁免清单）
+_WAIT_NATURED_COMMANDS = frozenset({
+    "sleep", "ping", "wait", "pause", "timeout", "yes", "watch", "top", "tailf",
+})
+
+
+# Shell 工具的动作集合（对齐 builtin_file 的 action 模式，工具数量不增加）
+_SHELL_ACTIONS = frozenset({"run", "background", "stop", "list"})
+
+
+def _auto_background_eligible(command: str) -> bool:
+    """保险丝判定：命令是否适合在阻塞预算耗尽时转入后台。"""
+    normalized = " ".join(command.split()).lower()
+    if re.search(r"\btail\s+(-\w+\s+)*-f\b", normalized):
+        return False  # tail -f 本身就是常驻跟随
+    for segment in _SEQUENCE_SPLIT.split(normalized):
+        tokens = [t for t in segment.split() if t]
+        while tokens and tokens[0].strip("\"'") in _SUDO_PREFIX:
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        head = tokens[0].strip("\"'").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if head in _WAIT_NATURED_COMMANDS:
+            return False
+    return True
+
+
+def _resolve_shell_timeout(raw) -> int:
+    """超时秒数解析：非整数报错；超出上限按上限截断不报错（对齐参考实现）。"""
+    max_timeout = settings.tool_shell_timeout_max_seconds
+    if raw is None:
+        return settings.tool_shell_timeout_seconds
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or int(raw) != raw:
+        raise ToolParamError(
+            "超时时间不合法",
+            fields={"timeout": "timeout 须为秒数（整数）"},
+        )
+    return max(1, min(int(raw), max_timeout))
+
+
+def _run_shell_foreground(command: str, timeout: int, workspace_root) -> dict:
+    """前台执行：限时等待；阻塞预算耗尽且适合转后台时转入后台而不是杀掉。
+
+    输出由后台线程实时收集（内存缓冲 + 可选日志落盘），主线程只负责
+    等待与超时判定——这样转后台时输出管道无需交接，模型可以随时用
+    文件工具读到进展。
+    """
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=workspace_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        env=child_env(),
+        start_new_session=(sys.platform != "win32"),  # POSIX 新进程组，树杀要用
+        bufsize=0,  # 无缓冲管道：read1 才能读到零星输出
+    )
+    logfile = JobLogFile()
+    stdout_collector = OutputCollector()
+    stderr_collector = OutputCollector()
+    drain_threads = [
+        threading.Thread(
+            target=drain_stream, args=(process.stdout, stdout_collector, logfile, False), daemon=True
+        ),
+        threading.Thread(
+            target=drain_stream, args=(process.stderr, stderr_collector, logfile, True), daemon=True
+        ),
+    ]
+    for thread in drain_threads:
+        thread.start()
+
+    budget = max(1, settings.tool_shell_blocking_budget_seconds)
+    first_wait = min(budget, timeout)
+    timed_out = False
+    try:
+        process.wait(timeout=first_wait)
+    except subprocess.TimeoutExpired:
+        if first_wait < timeout and _auto_background_eligible(command):
+            # 保险丝：不杀，转后台。收集线程继续把输出写进日志文件，
+            # 任务照常登记退出通知，模型下一轮即可读到进展。
+            job = SHELL_JOBS.adopt(
+                process, command, workspace_root, logfile, stdout_collector, stderr_collector
+            )
+            return {
+                "command": command,
+                "action": "run",
+                "autoBackgrounded": True,
+                **job.to_payload(),
+                "message": (
+                    f"命令执行超过 {first_wait} 秒仍未结束，已自动转入后台且未被终止；"
+                    f"稍后用文件读写工具读取 {job.log_path} 查看进展，"
+                    "不需要时用 action=stop 并携带 taskId 停止。"
+                ),
+            }
+        try:
+            process.wait(timeout=timeout - first_wait)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            kill_tree(process.pid)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    for thread in drain_threads:
+        thread.join(timeout=5)
+    logfile.close()
+
+    stdout, stdout_clipped, stdout_persisted = _clip(stdout_collector.snapshot_text(), workspace_root)
+    stderr, stderr_clipped, stderr_persisted = _clip(stderr_collector.snapshot_text(), workspace_root)
+    result = {
         "command": command,
-        "exitCode": completed.returncode,
-        "success": completed.returncode == 0,
+        "action": "run",
+        "exitCode": None if timed_out else process.returncode,
+        "success": not timed_out and process.returncode == 0,
+        "timedOut": timed_out,
         "stdout": stdout,
         "stderr": stderr,
-        "durationMs": duration_ms,
+        "durationMs": int((time.monotonic() - started) * 1000),
         "truncated": stdout_clipped or stderr_clipped,
     }
+    if timed_out:
+        result["message"] = f"命令执行超过 {timeout} 秒，已被整树终止（进程树内子进程一并结束）"
+    persisted = stdout_persisted or stderr_persisted
+    if persisted:
+        result["persistedOutputPath"] = persisted
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +466,18 @@ def run_file(params: dict, context: ToolContext | None = None) -> dict:
     raw_path = str(params.get("path") or "")
     target = _resolve_in_workspace(raw_path, context)
 
+    tail_lines = params.get("tail_lines")
+    if action == "read" and tail_lines is not None:
+        if (
+            isinstance(tail_lines, bool)
+            or not isinstance(tail_lines, int)
+            or not 1 <= tail_lines <= _READ_TAIL_MAX_LINES
+        ):
+            raise ToolParamError(
+                "tail_lines 取值不合法",
+                fields={"tail_lines": f"tail_lines 须为 1–{_READ_TAIL_MAX_LINES} 的整数"},
+            )
+        return _read_file(target, raw_path.strip(), tail_lines=tail_lines)
     if action == "read":
         return _read_file(target, raw_path.strip())
 
@@ -339,7 +493,7 @@ def run_file(params: dict, context: ToolContext | None = None) -> dict:
     return _write_file(target, raw_path.strip(), content, mode)
 
 
-def _read_file(target: Path, raw_path: str) -> dict:
+def _read_file(target: Path, raw_path: str, tail_lines: int | None = None) -> dict:
     if not target.exists():
         raise ToolExecutionError(
             f"文件不存在：{target}",
@@ -352,10 +506,32 @@ def _read_file(target: Path, raw_path: str) -> dict:
         )
     size = target.stat().st_size
     limit = settings.tool_file_size_limit
+
+    if tail_lines is not None:
+        # 只读末尾 N 行：从文件末尾最多回看 1MB，适合翻看不断增长的后台
+        # 任务日志（整读会撞大小上限，而且增长中的日志错误多在末尾）
+        window = 1024 * 1024
+        with open(target, "rb") as handle:
+            handle.seek(max(size - window, 0))
+            raw = handle.read()
+        lines = _decode(raw).splitlines()
+        truncated_start = size > window
+        if truncated_start and lines:
+            lines = lines[1:]  # 窗口起点大概率截断了一行，丢弃防乱码
+        return {
+            "action": "read",
+            "path": raw_path,
+            "absolutePath": str(target),
+            "sizeBytes": size,
+            "content": "\n".join(lines[-tail_lines:]),
+            "tailLines": tail_lines,
+            "truncatedStart": truncated_start,
+        }
+
     if size > limit:
         raise ToolExecutionError(
             f"文件过大（{size} 字节），超过单次读取上限 {limit} 字节",
-            hint="请改用 Shell 工具配合 head、tail 等命令分段查看大文件",
+            hint="请改用 tail_lines 参数只读末尾 N 行，或用 Shell 工具配合 head、tail 等命令分段查看",
         )
     return {
         "action": "read",
@@ -643,21 +819,35 @@ def run_grep(params: dict, context: ToolContext | None = None) -> dict:
 # 共用：输出解码与截断
 # ---------------------------------------------------------------------------
 
+# 文件读取 tail_lines 的上限
+_READ_TAIL_MAX_LINES = 500
+
 
 def _decode(raw: bytes) -> str:
     """优先 UTF-8，其次系统本地编码（中文 Windows 为 GBK），兜底逐字节替换。"""
-    for encoding in ("utf-8", locale.getpreferredencoding(False)):
-        if not encoding:
-            continue
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    return decode_output(raw)
 
 
-def _clip(text: str) -> tuple[str, bool]:
+def _clip(text: str, workspace_root=None) -> tuple[str, bool, str | None]:
+    """超长输出保留头部 60% + 尾部 40%（错误几乎都在末尾）。
+
+    截断发生时把全量文本落盘留底稿并返回路径，模型可用文件工具翻看
+    完整输出；落盘失败不阻断执行，只少一个底稿路径。
+    """
     limit = settings.tool_shell_output_limit
     if len(text) <= limit:
-        return text, False
-    return text[:limit] + f"\n…[输出过长，已截断：原始长度 {len(text)} 字符]", True
+        return text, False, None
+    head_len = int(limit * 0.6)
+    tail_len = limit - head_len
+    omitted = len(text) - head_len - tail_len
+    inline = (
+        f"{text[:head_len]}\n…[中间省略 {omitted} 字符，原始长度 {len(text)} 字符，"
+        f"全量输出已落盘]…\n{text[-tail_len:]}"
+    )
+    persisted = None
+    if workspace_root is not None:
+        try:
+            persisted = SHELL_JOBS.save_output_snapshot(workspace_root, text)
+        except OSError:
+            persisted = None
+    return inline, True, persisted

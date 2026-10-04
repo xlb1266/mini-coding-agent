@@ -7,6 +7,21 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import locale
+
+
+def decode_output(raw: bytes) -> str:
+    """子进程/文件输出解码：优先 UTF-8，其次系统本地编码（中文 Windows 为
+    GBK），兜底逐字节替换。handlers 与 shell_jobs 共用。"""
+    for encoding in ("utf-8", locale.getpreferredencoding(False)):
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
 
 @dataclass(frozen=True)
 class ToolContext:

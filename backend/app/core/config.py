@@ -27,10 +27,14 @@ class Settings(BaseSettings):
     default_timezone: str = "Asia/Shanghai"
     # 文件读写工具的授权目录：只允许读写该目录内的文件
     tool_workspace_dir: Path = BASE_DIR / "tool_workspace"
-    # Shell 工具：默认与最大超时秒数、stdout/stderr 各自保留的最大字符数
+    # Shell 工具：默认与最大超时秒数（超出上限按上限截断不报错）、stdout/stderr
+    # 内联保留的最大字符数；前台阻塞预算秒数（超时且命令适合转后台时不杀，转后台）
     tool_shell_timeout_seconds: int = 30
-    tool_shell_timeout_max_seconds: int = 120
+    tool_shell_timeout_max_seconds: int = 600
     tool_shell_output_limit: int = 10000
+    tool_shell_blocking_budget_seconds: int = 15
+    # Shell 后台任务：日志与登记文件目录（相对工作区根）
+    tool_shell_job_dir: str = ".mini-agent/jobs"
     # 文件读写工具：单次读取/写入的最大字节数
     tool_file_size_limit: int = 512 * 1024
 

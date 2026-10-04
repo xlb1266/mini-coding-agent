@@ -63,32 +63,57 @@ BUILTIN_TOOLS: list[ToolDefinition] = [
         key="builtin_shell",
         name="Shell 命令执行",
         description=(
-            "在本机执行 shell 命令并返回标准输出、错误输出与退出码。适用场景："
-            "查看系统信息、搜索文件、运行脚本、执行测试等需要操作本地环境的任务。"
-            "输入要求：command 为完整的命令字符串，按系统默认 shell（Windows 为 cmd，"
-            "macOS/Linux 为 sh）执行；timeout 为可选的超时秒数（1–120，默认 30）。"
-            "使用限制：以下危险命令会在执行层被直接拦截并返回 blocked 错误——"
-            "递归删除根目录或系统目录（如 rm -rf /）、格式化磁盘或直接写入磁盘设备"
+            "在本机执行 shell 命令，支持前台执行、后台托管与后台任务管理。"
+            "适用场景：查看系统信息、安装依赖、运行测试、启动开发服务器等"
+            "需要操作本地环境的任务。输入要求：action 为 run（前台执行，默认）、"
+            "background（后台启动）、stop（停止后台任务）或 list（列出后台任务）；"
+            "command 为完整的命令字符串，按系统默认 shell（Windows 为 cmd，"
+            "macOS/Linux 为 sh）执行；timeout 为可选的前台超时秒数（1–600，"
+            "默认 30，超出上限按 600 处理）。后台用法闭环：启动开发服务器等"
+            "长驻命令用 action=background——立即返回 taskId 与输出文件路径，"
+            "不等待退出；稍后用文件读写工具读取该输出文件确认服务已启动；"
+            "完成验收后用 action=stop 并携带 taskId 停止。前台命令若超过阻塞"
+            "预算（默认 15 秒）且适合后台运行（sleep、ping 等本应等待的命令"
+            "除外），会自动转入后台并返回 taskId，命令不会被终止。使用限制："
+            "以下危险命令会在执行层被直接拦截并返回 blocked 错误——递归删除"
+            "根目录或系统目录（如 rm -rf /）、格式化磁盘或直接写入磁盘设备"
             "（format、mkfs、dd of=/dev/…）、修改关键系统权限（icacls、takeown，"
-            "以及对系统目录的 chmod/chown）、关闭杀毒软件或防火墙、读取或外传密钥"
-            "（.ssh、.aws、.env、secret.key 等路径，以及 printenv）、未经检查直接"
-            "执行远程下载的脚本（如 curl … | sh、Invoke-Expression）；输出超过上限"
-            "会被截断。拦截规则是尽力而为的黑名单，不能替代操作系统级的隔离。"
+            "以及对系统目录的 chmod/chown）、关闭杀毒软件或防火墙、读取或外传"
+            "密钥（.ssh、.aws、.env、secret.key 等路径，以及 printenv）、未经"
+            "检查直接执行远程下载的脚本（如 curl … | sh、Invoke-Expression）；"
+            "输出超过上限时内联部分保留头尾并标注，全量输出落盘后通过 "
+            "persistedOutputPath 返回，可用文件读写工具翻看；后台任务不会自动"
+            "超时，不需要时必须显式停止。拦截规则是尽力而为的黑名单，不能"
+            "替代操作系统级的隔离。"
         ),
         params=[
             ToolParamSpec(
+                name="action",
+                type="string",
+                required=False,
+                description="run（前台执行，默认）、background（后台启动）、stop（停止后台任务）、list（列出后台任务）",
+                example="run",
+            ),
+            ToolParamSpec(
                 name="command",
                 type="string",
-                required=True,
-                description="要执行的完整命令字符串",
+                required=False,
+                description="要执行的完整命令字符串；action=run 或 background 时必填",
                 example="git status",
             ),
             ToolParamSpec(
                 name="timeout",
                 type="integer",
                 required=False,
-                description="超时秒数，1–120；留空时使用系统默认值 30 秒",
+                description="前台超时秒数，1–600，默认 30，超出上限按 600 处理；后台任务不受此限制",
                 example="30",
+            ),
+            ToolParamSpec(
+                name="taskId",
+                type="string",
+                required=False,
+                description="要停止的后台任务 ID；action=stop 时必填（由 background 返回）",
+                example="a1b2c3d4e5f6",
             ),
         ],
         handler=run_shell,
@@ -102,7 +127,8 @@ BUILTIN_TOOLS: list[ToolDefinition] = [
             "或 write（写入）；path 支持两种写法——相对工作区根目录的相对路径"
             "（如 notes/todo.md）或工作区内的绝对路径，不允许访问工作区之外的文件；"
             "write 时必须提供 content，内容以 UTF-8 保存。使用限制：单次读取或写入"
-            "不超过 512KB，读取大文件请改用 Shell 工具分段查看；读取的文件必须已存在；"
+            "不超过 512KB，读取大文件请改用 tail_lines 参数只读末尾 N 行（如后台"
+            "任务日志），或用 Shell 工具分段查看；读取的文件必须已存在；"
             "写入模式 mode=overwrite 覆盖已有文件（不存在则连同父目录一起创建），"
             "mode=create 仅在文件不存在时创建（已存在则报错，需要覆盖请改用 overwrite），"
             "mode=append 追加到文件末尾（不存在则创建）。"
@@ -134,6 +160,13 @@ BUILTIN_TOOLS: list[ToolDefinition] = [
                 required=False,
                 description="写入模式：overwrite（覆盖，默认）、create（仅新建）、append（追加）；仅 action=write 时有效",
                 example="overwrite",
+            ),
+            ToolParamSpec(
+                name="tail_lines",
+                type="integer",
+                required=False,
+                description="仅 action=read：只读文件末尾 N 行（1–500），适合翻看后台任务日志；不填时整读（512KB 上限）",
+                example="100",
             ),
         ],
         handler=run_file,

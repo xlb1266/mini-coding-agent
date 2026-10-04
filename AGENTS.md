@@ -4,7 +4,7 @@
 
 ## 项目简介
 
-mini-coding-agent 是一个本地优先的 coding agent 工作台，由 mini-agent 底座（`main` 的 `869fd50`）派生而来的独立项目，包含聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测八个模块。coding agent 特化已开始（阶段十三，分支 `feature/coding-agent-mvp`）：Agent 可绑定本机工作区目录（文件工具沙箱与 Shell 执行目录跟随），内置文件编辑 / 列目录 / 搜索工具，Shell 命令与文件写入支持执行前人工审批（默认关闭，按 Agent 开启）。项目按阶段逐步实现，各阶段进度与实现说明见 docs/ 下的阶段文档；Agent Loop 统一由 `app/services/agent_runtime.py` 的 AgentRuntime 执行（聊天与后续评测共用），上下文容量管理与自动压缩也在统一 Runtime 内实现（摘要与边界保存在会话上，聊天记录不被删除或改写），本地工具执行一律走统一入口 `app/services/tools/executor.py`；运行记录与可观察性由 `app/services/run_recorder.py` 落库（一次发送消息对应一条 Run，事件复用 Runtime 真实输出，`/api/runs` 提供列表、详情时间线与详细载荷读取）。
+mini-coding-agent 是一个本地优先的 coding agent 工作台，由 mini-agent 底座（`main` 的 `869fd50`）派生而来的独立项目，包含聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测八个模块。coding agent 特化已开始（阶段十三/十四，分支 `feature/coding-agent-mvp`）：Agent 可绑定本机工作区目录（文件工具沙箱与 Shell 执行目录跟随），内置文件编辑 / 列目录 / 搜索工具，Shell 支持前台执行、后台任务托管（启动 dev server 等长驻命令，跨轮次存活、退出通知注入、整树击杀停止）与前台阻塞预算保险丝（超时自动转后台），Shell 命令与文件写入支持执行前人工审批（默认关闭，按 Agent 开启，Shell 按动作区分）。项目按阶段逐步实现，各阶段进度与实现说明见 docs/ 下的阶段文档；Agent Loop 统一由 `app/services/agent_runtime.py` 的 AgentRuntime 执行（聊天与后续评测共用），上下文容量管理与自动压缩也在统一 Runtime 内实现（摘要与边界保存在会话上，聊天记录不被删除或改写），本地工具执行一律走统一入口 `app/services/tools/executor.py`；运行记录与可观察性由 `app/services/run_recorder.py` 落库（一次发送消息对应一条 Run，事件复用 Runtime 真实输出，`/api/runs` 提供列表、详情时间线与详细载荷读取）。
 
 ## 固定技术栈
 
@@ -99,7 +99,7 @@ npm run dev -- --port 5174                                 # 启动 Vite 开发�
 3. `uv run alembic upgrade head` 应用迁移
 4. `uv run pytest` 确认无回归
 
-当前迁移链：`0001_baseline`（空基线）→ `0002_create_model_tables`（模型管理两张表）→ `0003_create_mcp_tables`（MCP 管理两张表）→ `0004_create_skills_table`（Skills 登记表）→ `0005_create_tools`（工具表与内置工具种子，固定只插最初三个工具 key）→ `0006_create_agents`（Agent 管理两张表）→ `0007_create_chat_tables`（聊天两张表）→ `0008_add_context_compaction`（Agent 压缩配置四列 + 会话摘要与压缩边界两列）→ `0009_create_run_records`（运行记录三张表：Run 主记录 / 安全事件 / 详细载荷）→ `0010_create_evaluation_tables`（Agent 评测四张表 + agent_runs.source 列）→ `0011_add_agent_workspace`（agents 加工作区目录与审批开关两列）→ `0012_add_coding_tools`（三个 coding 内置工具种子行）。连接串统一读自 `app/core/config.py` 的 `settings.database_url`。
+当前迁移链：`0001_baseline`（空基线）→ `0002_create_model_tables`（模型管理两张表）→ `0003_create_mcp_tables`（MCP 管理两张表）→ `0004_create_skills_table`（Skills 登记表）→ `0005_create_tools`（工具表与内置工具种子，固定只插最初三个工具 key）→ `0006_create_agents`（Agent 管理两张表）→ `0007_create_chat_tables`（聊天两张表）→ `0008_add_context_compaction`（Agent 压缩配置四列 + 会话摘要与压缩边界两列）→ `0009_create_run_records`（运行记录三张表：Run 主记录 / 安全事件 / 详细载荷）→ `0010_create_evaluation_tables`（Agent 评测四张表 + agent_runs.source 列）→ `0011_add_agent_workspace`（agents 加工作区目录与审批开关两列）→ `0012_add_coding_tools`（三个 coding 内置工具种子行）→ `0013_add_message_timeline`（chat_messages 加 timeline_json，回复过程轨迹随消息入库）→ `0014_shell_background`（更新 Shell 与文件读写工具定义：action 后台任务 / tail_lines 尾部读取，仅 UPDATE 两行描述与参数）。连接串统一读自 `app/core/config.py` 的 `settings.database_url`。
 
 ## 配色与字号入口
 

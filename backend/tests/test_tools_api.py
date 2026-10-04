@@ -42,12 +42,14 @@ class TestList:
 
         detail = client.get(f"/api/tools/{shell['id']}").json()
 
-        assert [param["name"] for param in detail["parameters"]] == ["command", "timeout"]
-        command = detail["parameters"][0]
-        assert command["required"] is True
-        assert command["type"] == "string"
-        assert command["description"]
-        timeout = detail["parameters"][1]
+        assert [param["name"] for param in detail["parameters"]] == [
+            "action", "command", "timeout", "taskId",
+        ]
+        action = detail["parameters"][0]
+        assert action["required"] is False
+        assert action["type"] == "string"
+        assert action["description"]
+        timeout = detail["parameters"][2]
         assert timeout["required"] is False
         # 工具说明包含适用场景 / 输入要求 / 使用限制三部分
         for section in ("适用场景", "输入要求", "使用限制"):
