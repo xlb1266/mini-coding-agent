@@ -68,6 +68,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 from app.core.secret_box import SecretBox
+from app.db.models.agent import Agent
 from app.db.models.chat import (
     ChatMessage,
     ChatSession,
@@ -77,6 +78,16 @@ from app.db.models.chat import (
     STATUS_INCOMPLETE,
 )
 from app.db.models.model_config import ModelConfig
+from app.db.models.stage_project import (
+    PROJECT_AWAITING_START,
+    PROJECT_AWAITING_SUMMARY,
+    PROJECT_COMPLETED,
+    PROJECT_IN_PROGRESS,
+    PROJECT_ROLE_PLAN,
+    PROJECT_ROLE_SUMMARY,
+    PROJECT_SUMMARIZING,
+    StageProject,
+)
 from app.schemas.chat import (
     DEFAULT_SESSION_TITLE,
     SESSION_TITLE_SNIPPET_LENGTH,
@@ -94,6 +105,10 @@ from app.services.agent_runtime import (
     RUN_START,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
+    STATUS_ERROR,
+    STATUS_PLAN_SUBMITTED,
+    STATUS_ROUNDS_EXHAUSTED,
+    STATUS_STAGE_COMPLETE,
     TEXT_DELTA,
     TOOL_CALL_END,
     TOOL_CALL_START,
@@ -387,8 +402,11 @@ class GenerationRun:
     # 会话压缩状态：当前有效摘要与已压缩边界（None 表示尚未压缩）
     session_summary: str = ""
     summary_boundary: int | None = None
-    # 工具执行审批（模块二）：Agent 开启审批时为 True，评测路径始终不审批
-    require_approval: bool = False
+    # 工具执行审批（模块二）：审批档位不为 off 时提供钩子，评测路径始终不审批
+    approval_level: str = "off"
+    # 运行级工作区覆盖（阶段化开发 v2）：项目下的会话把项目钉住的目录
+    # 写上会话；空串表示跟随 Agent 配置的工作区
+    workspace_dir: str = ""
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     run_id: str | None = None
     # 运行开始的墙上时间（epoch 毫秒）：展示“处理中 Xs”用，刷新后仍准确
@@ -447,7 +465,8 @@ class GenerationManager:
         model_id: int | None = None,
         model_name: str = "",
         model_identifier: str = "",
-        require_approval: bool = False,
+        approval_level: str = "off",
+        workspace_dir: str = "",
     ) -> None:
         """启动一次后台运行；同一会话同时只允许一个运行。
 
@@ -471,7 +490,8 @@ class GenerationManager:
             model_identifier=model_identifier,
             session_summary=session_summary,
             summary_boundary=summary_boundary,
-            require_approval=require_approval,
+            approval_level=approval_level,
+            workspace_dir=workspace_dir,
             started_at_ms=int(time.time() * 1000),
         )
         recorder = RunRecorder(
@@ -709,7 +729,15 @@ class GenerationManager:
         self._broadcast(run, event)
 
     def _handle_run_end(self, run: GenerationRun, event: dict[str, Any]) -> None:
-        """运行结束：按状态保存回复正文，把已保存消息附加到终态事件。"""
+        """运行结束：按状态保存回复正文，把已保存消息附加到终态事件。
+
+        阶段收尾（stage_complete）：回复按完成保存，把 finish_stage 的
+        阶段摘要写上会话（awaiting_acceptance）等待用户验收，并推进所属
+        阶段项目的进度（阶段化开发 v2）。
+        计划上报（plan_submitted）：创建（或覆盖）阶段项目，把会话挂为
+        规划会话，等待用户确认开始。
+        汇总会话完成：项目标记 completed，整个阶段流程收尾。
+        """
         status = event.get("status")
         final_event = dict(event)
         final_event.setdefault("message", None)
@@ -717,7 +745,11 @@ class GenerationManager:
         finalize_timeline(run, str(status or ""))
 
         if run.content.strip():
-            db_status = STATUS_COMPLETED if status == STATUS_COMPLETED else STATUS_INCOMPLETE
+            db_status = (
+                STATUS_COMPLETED
+                if status in (STATUS_COMPLETED, STATUS_STAGE_COMPLETE, STATUS_PLAN_SUBMITTED)
+                else STATUS_INCOMPLETE
+            )
             try:
                 message = self._save_assistant_message(run, db_status)
                 final_event["message"] = message_event_payload(message)
@@ -732,7 +764,169 @@ class GenerationManager:
                     ),
                     "hint": "内容仅在当前页面可见，刷新后会丢失",
                 }
+        if status == STATUS_STAGE_COMPLETE:
+            try:
+                self._mark_stage_awaiting(run, event.get("stage"))
+            except Exception:
+                logger.exception("保存阶段验收状态失败 session_id=%s", run.session_id)
+            try:
+                self._mark_project_stage_done(run)
+            except Exception:
+                logger.exception("推进阶段项目进度失败 session_id=%s", run.session_id)
+        elif status == STATUS_PLAN_SUBMITTED:
+            try:
+                self._handle_plan_submitted(run, event.get("plan"))
+            except Exception:
+                logger.exception("创建阶段项目失败 session_id=%s", run.session_id)
+        if status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_ERROR, STATUS_ROUNDS_EXHAUSTED):
+            try:
+                self._settle_project_summary(run, str(status or ""))
+            except Exception:
+                logger.exception("收尾项目汇总状态失败 session_id=%s", run.session_id)
         self._finish(run, final_event)
+
+    def _mark_stage_awaiting(self, run: GenerationRun, stage: Any) -> None:
+        """阶段收尾：把验收状态与阶段摘要写上会话（幂等，短事务）。"""
+        if not isinstance(stage, dict):
+            stage = {}
+        summary: dict[str, str] = {}
+        for key in ("stageName", "summary", "handoffPath", "nextStep"):
+            value = stage.get(key)
+            if isinstance(value, str) and value.strip():
+                summary[key] = value.strip()
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None:
+                return
+            session.awaiting_acceptance = True
+            session.stage_summary_json = (
+                redact(json.dumps(summary, ensure_ascii=False), run.api_key) if summary else None
+            )
+            session.updated_at = utcnow()
+            db.commit()
+        finally:
+            db.close()
+
+    # ---- 阶段项目状态机（阶段化开发 v2） ----
+
+    def _handle_plan_submitted(self, run: GenerationRun, plan: Any) -> None:
+        """plan_submitted：创建（或覆盖）阶段项目并将会话挂为规划会话。
+
+        项目钉住的工作区取会话上的目录；规划会话没有时回落 Agent 配置的
+        工作区（与本次运行实际使用的一致），后续阶段会话一律继承该目录。
+        """
+        if not isinstance(plan, dict):
+            return
+        stages_raw = plan.get("stages")
+        if not isinstance(stages_raw, list):
+            return
+        plan_items: list[dict[str, str]] = []
+        for item in stages_raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            goal = item.get("goal")
+            if isinstance(name, str) and name.strip() and isinstance(goal, str) and goal.strip():
+                plan_items.append({"name": name.strip(), "goal": goal.strip(), "status": "pending"})
+        if not plan_items:
+            return
+        title = plan.get("title")
+        title = title.strip() if isinstance(title, str) and title.strip() else "开发项目"
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None:
+                return
+            workspace = (session.workspace_dir or "").strip()
+            if not workspace and run.agent_id is not None:
+                agent = db.get(Agent, run.agent_id)
+                workspace = (agent.workspace_dir or "").strip() if agent is not None else ""
+            now = utcnow()
+            project = db.get(StageProject, session.project_id) if session.project_id else None
+            if project is None:
+                project = StageProject(
+                    title=title,
+                    agent_id=run.agent_id,
+                    agent_name=run.agent_name,
+                    workspace_dir=workspace,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(project)
+                db.flush()
+            # 同一规划会话再次提交计划：覆盖旧计划并回到待开始
+            project.title = title[:128]
+            project.plan_json = json.dumps(plan_items, ensure_ascii=False)
+            project.current_stage = 0
+            project.status = PROJECT_AWAITING_START
+            project.updated_at = now
+            session.project_id = project.id
+            session.project_role = PROJECT_ROLE_PLAN
+            session.stage_index = None
+            session.updated_at = now
+            db.commit()
+        finally:
+            db.close()
+
+    def _mark_project_stage_done(self, run: GenerationRun) -> None:
+        """stage_complete：把所属项目里本阶段标记为 done 并推进状态。
+
+        还有未完成阶段时进入 in_progress（current_stage 指向下一个待办
+        阶段）；全部完成时转入 awaiting_summary，等待用户发起汇总。
+        """
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None or session.project_id is None or session.stage_index is None:
+                return
+            project = db.get(StageProject, session.project_id)
+            if project is None:
+                return
+            try:
+                plan = json.loads(project.plan_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                return
+            if not isinstance(plan, list):
+                return
+            stage_index = session.stage_index
+            if isinstance(stage_index, int) and 1 <= stage_index <= len(plan):
+                plan[stage_index - 1]["status"] = "done"
+            next_index = next(
+                (i + 1 for i, item in enumerate(plan) if isinstance(item, dict) and item.get("status") != "done"),
+                0,
+            )
+            if next_index == 0:
+                project.status = PROJECT_AWAITING_SUMMARY
+                project.current_stage = len(plan)
+            else:
+                project.status = PROJECT_IN_PROGRESS
+                project.current_stage = next_index
+            project.plan_json = json.dumps(plan, ensure_ascii=False)
+            project.updated_at = utcnow()
+            db.commit()
+        finally:
+            db.close()
+
+    def _settle_project_summary(self, run: GenerationRun, status: str) -> None:
+        """汇总会话运行收尾：completed 标记项目完成；失败/取消回退到
+        awaiting_summary 允许重试。其他角色的会话不受影响。"""
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None or session.project_role != PROJECT_ROLE_SUMMARY or session.project_id is None:
+                return
+            project = db.get(StageProject, session.project_id)
+            if project is None:
+                return
+            if status == STATUS_COMPLETED:
+                project.status = PROJECT_COMPLETED
+            elif project.status == PROJECT_SUMMARIZING:
+                project.status = PROJECT_AWAITING_SUMMARY
+            project.updated_at = utcnow()
+            db.commit()
+        finally:
+            db.close()
 
     def _persist_summary(self, run: GenerationRun, summary: str, boundary: int) -> None:
         """压缩成功的持久化回调：新摘要与边界一致写入会话（失败抛异常）。
@@ -772,10 +966,10 @@ class GenerationManager:
                 secret_box=run.secret_box,
                 skills_dir=run.skills_dir,
             )
-            # 审批钩子仅当 Agent 开启审批时提供；评测路径不经过这里，
+            # 审批钩子仅当审批档位不为 off 时提供；评测路径不经过这里，
             # RuntimeRequest.approval 为 None，工具调用一律自动执行
             approval_hooks: ApprovalHooks | None = None
-            if run.require_approval:
+            if run.approval_level and run.approval_level != "off":
                 approval_hooks = ApprovalHooks(
                     timeout_seconds=settings.approval_timeout_seconds,
                     open_request=lambda info: self._wait_approval(run, info),
@@ -793,6 +987,7 @@ class GenerationManager:
                     run, summary, boundary
                 ),
                 approval=approval_hooks,
+                workspace_dir=run.workspace_dir,
             )
             await runtime.run(
                 request,

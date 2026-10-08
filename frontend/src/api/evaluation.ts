@@ -75,6 +75,8 @@ export interface TaskStats {
   scoringCases: number
   /** 仅统计获得合法评分的用例；无有效评分时为 null（展示"暂无评分"） */
   averageScore: number | null
+  /** 过程评分均值（阶段十五）；无过程分时为 null */
+  averageProcessScore: number | null
 }
 
 export interface EvalTaskItem {
@@ -108,6 +110,9 @@ export interface EvalCaseResult {
   actualAnswer: string | null
   score: number | null
   reason: string | null
+  /** 过程评分（阶段十五）：LLM Judge 对执行过程合理性的打分与理由 */
+  processScore: number | null
+  processReason: string | null
   /** 关联的目标 Agent Run（运行详情页按数字 id 打开） */
   runId: number | null
   runUid: string | null
@@ -189,4 +194,34 @@ export function createTask(payload: TaskPayload): Promise<EvalTaskItem> {
 /** 启动待运行任务；重复启动 / 已完成 / 已中断返回 409 */
 export function startTask(id: number): Promise<EvalTaskItem> {
   return post<EvalTaskItem>(`/api/evaluations/tasks/${id}/start`)
+}
+
+// ---- 回归对比（阶段十五） ----
+
+export interface CompareCase {
+  caseOrder: number
+  question: string
+  baseStatus: string
+  targetStatus: string
+  baseScore: number | null
+  targetScore: number | null
+  baseProcessScore: number | null
+  targetProcessScore: number | null
+}
+
+export interface TaskCompare {
+  baseTaskId: number
+  targetTaskId: number
+  baseStats: TaskStats
+  targetStats: TaskStats
+  /** 差值 = target - base；一侧无数据时为 null */
+  averageScoreDelta: number | null
+  averageProcessScoreDelta: number | null
+  passRateDelta: number | null
+  cases: CompareCase[]
+}
+
+/** 回归对比：对同一数据集的两个任务按用例顺序对照得分。 */
+export function compareTasks(baseTaskId: number, targetTaskId: number): Promise<TaskCompare> {
+  return get<TaskCompare>(`/api/evaluations/tasks/${baseTaskId}/compare/${targetTaskId}`)
 }

@@ -74,6 +74,12 @@ from app.core.secret_box import SecretBox, SecretBoxError
 from app.db.models.agent import (
     Agent,
     AgentBinding,
+    APPROVAL_LEVELS,
+    APPROVAL_OFF,
+    APPROVAL_STANDARD,
+    APPROVAL_STRICT,
+    AUTONOMY_MODES,
+    AUTONOMY_STAGE_CONFIRM,
     CAPABILITY_MCP,
     CAPABILITY_SKILL,
     CAPABILITY_TOOL,
@@ -148,6 +154,12 @@ STATUS_COMPLETED = "completed"
 STATUS_ROUNDS_EXHAUSTED = "rounds_exhausted"
 STATUS_CANCELLED = "cancelled"
 STATUS_ERROR = "error"
+# 阶段确认模式（阶段十五）：模型调用 finish_stage 后主动结束本次运行，
+# 等待用户验收；与 completed 一样属于"正常收尾"，聊天侧保存完整回复
+STATUS_STAGE_COMPLETE = "stage_complete"
+# 阶段化开发 v2：模型调用 submit_stage_plan 上报阶段计划后主动结束本次
+# 运行，等待用户确认开始；聊天侧据此创建阶段项目
+STATUS_PLAN_SUBMITTED = "plan_submitted"
 
 # ---- 结束原因 ----
 REASON_MODEL_FINISHED = "model_finished"
@@ -158,6 +170,19 @@ REASON_CONFIG_ERROR = "config_error"
 REASON_MCP_START_FAILED = "mcp_start_failed"
 REASON_RUNTIME_ERROR = "runtime_error"
 REASON_CONTEXT_OVERFLOW = "context_overflow"
+REASON_STAGE_FINISHED = "stage_finished"
+REASON_PLAN_SUBMITTED = "plan_submitted"
+
+# finish_stage 是 Runtime 在阶段确认模式下提供的收尾工具，不属于 tools 表
+FINISH_STAGE_TOOL_NAME = "finish_stage"
+# submit_stage_plan 是 Runtime 在阶段确认模式下提供的规划工具（阶段化开发 v2）：
+# 只在"从 0 到 1 的开发需求"规划时调用，上报阶段计划后本次运行结束
+SUBMIT_STAGE_PLAN_TOOL_NAME = "submit_stage_plan"
+# 阶段计划允许的阶段数量范围
+PLAN_STAGES_MIN = 2
+PLAN_STAGES_MAX = 8
+# finish_stage 结果卡片里交接文档内容的展示上限
+HANDOFF_CONTENT_MAX_LENGTH = 4000
 
 # ---- 工具类型 ----
 TOOL_TYPE_BUILTIN = "builtin"
@@ -309,6 +334,11 @@ class RuntimeRequest:
 
     approval 为审批钩子（见 ApprovalHooks）：提供后，命中审批范围的
     工具调用（Shell 任意命令、文件写入、edit_file）会先请求人工审批。
+
+    workspace_dir 为运行级工作区覆盖（阶段化开发 v2）：项目下的阶段与
+    汇总会话创建时把项目钉住的目录写上会话，调用方传入后 Runtime 优先
+    使用（文件沙箱根与 Shell 工作目录跟随），保证多会话操作同一工作区；
+    空串表示回落 Agent 配置的工作区。
     """
 
     agent_id: int
@@ -319,6 +349,7 @@ class RuntimeRequest:
     summary_boundary_seq: int | None = None
     persist_summary: Callable[[str, int], None] | None = None
     approval: ApprovalHooks | None = None
+    workspace_dir: str = ""
 
 
 @dataclass
@@ -403,6 +434,13 @@ class _LoadedConfig:
     mcp_servers: list[_McpServerConfig]
     compaction: CompactionSettings
     capacity: Capacity
+    # ---- 自主档位与执行治理（阶段十五）----
+    # stage_confirm=阶段确认（提供 finish_stage）；autonomous=高度自主
+    autonomy_mode: str = AUTONOMY_STAGE_CONFIRM
+    # 审批档位：off / standard / strict；命中白名单的 Shell 命令免审批
+    approval_level: str = APPROVAL_OFF
+    # Shell 命令白名单（已解析为前缀列表）；黑名单仍然生效
+    shell_whitelist: list[str] = field(default_factory=list)
     # 运行级工具上下文：Agent 配置了工作区目录时构造，未配置为 None
     #（执行入口与 handler 回落到全局默认目录）
     tool_context: ToolContext | None = None
@@ -583,6 +621,80 @@ def _skill_catalog_section(skills: list[_SkillMeta]) -> str:
     return "\n".join(lines)
 
 
+def parse_shell_whitelist(text: str | None) -> list[str]:
+    """解析 Shell 命令白名单：按行 / 逗号分隔的命令前缀，去空去重保持顺序。"""
+    if not text:
+        return []
+    items: list[str] = []
+    for chunk in str(text).replace("\r\n", "\n").replace(",", "\n").split("\n"):
+        prefix = chunk.strip()
+        if prefix and prefix not in items:
+            items.append(prefix)
+    return items
+
+
+def command_matches_whitelist(command: str, whitelist: list[str]) -> bool:
+    """Shell 命令是否命中白名单：命令（压缩空白、小写）以前缀开头即命中。"""
+    normalized = " ".join(command.split()).lower()
+    if not normalized:
+        return False
+    for prefix in whitelist:
+        target = " ".join(prefix.split()).lower()
+        if target and normalized.startswith(target):
+            return True
+    return False
+
+
+def _stage_protocol_section() -> str:
+    """阶段确认模式附加到系统提示词的工作流协议（阶段化开发 v2）。
+
+    内容分四节：意图路由（决定走规划还是普通流程）、规划会话（提交
+    计划后停等）、阶段会话（交接文档 + finish_stage 收尾）、汇总任务。
+    """
+    return "\n".join([
+        "## 阶段化开发工作流",
+        "",
+        "### 意图路由（收到任务先判断，再决定怎么处理）",
+        "",
+        "- 从 0 到 1 的开发需求（新建项目、从零搭建整套系统等）：不要直接动手"
+        "写代码。先分析需求，拆解成 2–8 个阶段的开发计划，然后调用"
+        " submit_stage_plan 工具提交计划（每个阶段给出名称与目标）。提交后"
+        "本次运行结束，等待用户确认；确认后系统会为每个阶段创建独立会话，"
+        "逐阶段推进。",
+        "- 存量项目的增量开发、Bug 修复、问答与咨询：走普通对话流程，直接"
+        "处理任务，不要调用 submit_stage_plan。",
+        "- 拿不准是全新开发还是增量改动时：先用一句话向用户确认，再按上面"
+        "两条路由处理。",
+        "",
+        "### 规划会话（提交计划之后）",
+        "",
+        "submit_stage_plan 调用成功后本次运行结束，等待用户确认计划；"
+        "不要开始执行任何阶段的工作，也不要重复提交计划。",
+        "",
+        "### 阶段会话（按阶段推进开发）",
+        "",
+        "你按阶段推进开发：一次运行只完成一个阶段，完成后停下等待用户验收，"
+        "不要在一个运行里连续完成多个阶段。",
+        "",
+        "每个阶段按以下顺序收尾：",
+        "1. 完成开发与自检（跑测试 / 启动验证等，尽量接近真实验收）；",
+        "2. 用文件写入工具在工作区内生成本阶段的交接文档（Markdown），"
+        "文件名建议 `handoff-阶段N.md`，内容必须包含六个部分："
+        "背景、进度、已做决策、文件位置、下一步、验证方式；",
+        "3. 调用 finish_stage 工具（stageName 填阶段名，summary 概述本阶段成果，"
+        "handoffPath 填交接文档的相对路径，nextStep 填下一阶段建议），调用后"
+        "本次运行结束，交接文档内容会展示给用户；",
+        "4. 等待用户验收。用户批准后系统会开新会话进入下一阶段，也可能提出"
+        "修改意见，不要自行猜测验收结果。",
+        "",
+        "### 汇总任务",
+        "",
+        "汇总项目完成情况时：基于任务里给出的项目计划与各阶段交接信息，"
+        "输出整体汇报（做了什么、验证结果、遗留事项与使用说明），"
+        "不要修改代码，不要调用 finish_stage 或 submit_stage_plan。",
+    ])
+
+
 @dataclass
 class _ContextPlan:
     """一次运行发给模型的消息布局。
@@ -646,6 +758,12 @@ class _RunState:
     # 工具执行审批钩子（模块二）：None 表示本运行不审批（评测路径或未开启）
     approval: ApprovalHooks | None = None
     approval_count: int = 0
+    # 阶段收尾信息（阶段十五）：模型调用 finish_stage 后记录，本次运行以
+    # stage_complete 终态结束；结构 {stageName, summary, handoffPath, nextStep}
+    stage_result: dict[str, str] | None = None
+    # 阶段计划（阶段化开发 v2）：模型调用 submit_stage_plan 后记录，本次
+    # 运行以 plan_submitted 终态结束；结构 {"stages": [{"name", "goal"}]}
+    plan_result: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +929,25 @@ class AgentRuntime:
         if state.finished:
             return result
         state.finished = True
+        # 阶段收尾信息（finish_stage 参数，模型产出）：脱敏后随 run_end 下发
+        stage_payload: dict[str, str] | None = None
+        if state.stage_result is not None:
+            stage_payload = {
+                key: sanitize_display(value, state.secrets) for key, value in state.stage_result.items()
+            }
+        # 阶段计划（submit_stage_plan 参数，模型产出）：脱敏后随 run_end 下发
+        plan_payload: dict[str, Any] | None = None
+        if state.plan_result is not None:
+            plan_payload = {
+                "title": sanitize_display(str(state.plan_result.get("title") or ""), state.secrets),
+                "stages": [
+                    {
+                        "name": sanitize_display(str(item.get("name") or ""), state.secrets),
+                        "goal": sanitize_display(str(item.get("goal") or ""), state.secrets),
+                    }
+                    for item in state.plan_result.get("stages", [])
+                ]
+            }
         self._emit(
             state,
             {
@@ -825,6 +962,8 @@ class AgentRuntime:
                 "firstOutputMs": state.first_output_ms,
                 "tokenUsage": token_usage,
                 "content": state.content,
+                "stage": stage_payload,
+                "plan": plan_payload,
                 "error": {"type": error.error_type, "message": error.message, "hint": error.hint}
                 if error
                 else None,
@@ -958,9 +1097,13 @@ class AgentRuntime:
                 summary_target_tokens=agent.compact_summary_tokens,
             )
             # Agent 配置了工作区目录时构造运行级 ToolContext：文件沙箱根与
-            # Shell 工作目录跟随 Agent 工作区；未配置为 None，回落全局默认目录
-            workspace_dir = (agent.workspace_dir or "").strip()
+            # Shell 工作目录跟随 Agent 工作区；未配置为 None，回落全局默认目录。
+            # 运行级覆盖（阶段化开发 v2）优先：项目下的会话把项目钉住的目录
+            # 写上会话，调用方经 RuntimeRequest.workspace_dir 传入
+            workspace_dir = (request.workspace_dir or "").strip() or (agent.workspace_dir or "").strip()
             tool_context = ToolContext(workspace_root=Path(workspace_dir)) if workspace_dir else None
+            approval_level = agent.approval_level if agent.approval_level in APPROVAL_LEVELS else APPROVAL_OFF
+            autonomy_mode = agent.autonomy_mode if agent.autonomy_mode in AUTONOMY_MODES else AUTONOMY_STAGE_CONFIRM
             return _LoadedConfig(
                 agent_id=agent.id,
                 agent_name=agent.name,
@@ -977,6 +1120,9 @@ class AgentRuntime:
                 mcp_servers=mcp_servers,
                 compaction=compaction,
                 capacity=compute_capacity(compaction, model.context_length, model.max_output_tokens),
+                autonomy_mode=autonomy_mode,
+                approval_level=approval_level,
+                shell_whitelist=parse_shell_whitelist(agent.shell_whitelist),
                 tool_context=tool_context,
             )
         finally:
@@ -1041,6 +1187,98 @@ class AgentRuntime:
                 },
             )
 
+        if config.autonomy_mode == AUTONOMY_STAGE_CONFIRM:
+            # 阶段确认模式（阶段化开发 v2）：提供 submit_stage_plan 规划工具。
+            # 只用于"从 0 到 1 的开发需求"的意图路由；调用后本次运行以
+            # plan_submitted 结束，聊天侧据此创建阶段项目，不进入执行入口。
+            name = _unique_name(SUBMIT_STAGE_PLAN_TOOL_NAME, taken)
+            registry[name] = _ToolEntry(
+                name=name,
+                tool_type=TOOL_TYPE_BUILTIN,
+                display_name="提交阶段计划",
+                ref_key=SUBMIT_STAGE_PLAN_TOOL_NAME,
+                descriptor={
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": (
+                            "提交阶段化开发计划（仅用于从 0 到 1 的开发需求：分析需求后"
+                            "先提交计划，不要直接开始写代码）。提交后本次运行结束，等待"
+                            "用户确认；存量项目的增量开发与问答不要调用本工具。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "description": "项目标题，例如「待办清单 Web 应用」",
+                                },
+                                "stages": {
+                                    "type": "array",
+                                    "description": "阶段清单，2–8 项，按实施顺序排列",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {
+                                                "type": "string",
+                                                "description": "阶段名称，例如「阶段一：项目骨架」",
+                                            },
+                                            "goal": {
+                                                "type": "string",
+                                                "description": "该阶段的完成目标（做成什么样算完成）",
+                                            },
+                                        },
+                                        "required": ["name", "goal"],
+                                    },
+                                },
+                            },
+                            "required": ["title", "stages"],
+                        },
+                    },
+                },
+            )
+            # 阶段确认模式（阶段十五）：提供 finish_stage 收尾工具。
+            # 调用后本次运行以 stage_complete 结束，等待用户验收，不进入执行入口。
+            name = _unique_name(FINISH_STAGE_TOOL_NAME, taken)
+            registry[name] = _ToolEntry(
+                name=name,
+                tool_type=TOOL_TYPE_BUILTIN,
+                display_name="结束当前阶段",
+                ref_key=FINISH_STAGE_TOOL_NAME,
+                descriptor={
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": (
+                            "结束当前开发阶段（仅在完成交接文档并自检后调用）。调用后本次运行结束，"
+                            "等待用户验收；验收通过后用户会让你继续下一阶段。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "stageName": {
+                                    "type": "string",
+                                    "description": "本阶段名称，例如「阶段一：项目骨架」",
+                                },
+                                "summary": {
+                                    "type": "string",
+                                    "description": "本阶段成果概述（做了什么、验证结果）",
+                                },
+                                "handoffPath": {
+                                    "type": "string",
+                                    "description": "交接文档在工作区内的相对路径，例如 handoff-阶段一.md",
+                                },
+                                "nextStep": {
+                                    "type": "string",
+                                    "description": "下一阶段的建议内容",
+                                },
+                            },
+                            "required": ["stageName", "summary", "handoffPath", "nextStep"],
+                        },
+                    },
+                },
+            )
+
         for server_cfg in config.mcp_servers:
             state.secrets.extend(value for value in server_cfg.env.values() if value)
             session = McpSession(server_cfg.command, server_cfg.args, server_cfg.env)
@@ -1096,6 +1334,10 @@ class AgentRuntime:
         system = config.system_prompt
         if config.skills:
             section = _skill_catalog_section(config.skills)
+            system = f"{system.rstrip()}\n\n{section}" if system.strip() else section
+        if config.autonomy_mode == AUTONOMY_STAGE_CONFIRM:
+            # 阶段确认模式：附加阶段化工作流协议（交接文档 + finish_stage 收尾）
+            section = _stage_protocol_section()
             system = f"{system.rstrip()}\n\n{section}" if system.strip() else section
         boundary = request.summary_boundary_seq
         history: list[dict[str, Any]] = []
@@ -1213,6 +1455,18 @@ class AgentRuntime:
 
             for index, call in enumerate(tool_calls, start=1):
                 await self._execute_and_record(state, config, plan, round_no, index, call)
+                if state.plan_result is not None:
+                    # submit_stage_plan 已提交计划（阶段化开发 v2）：本次运行
+                    # 以计划已上报结束，等待用户确认开始
+                    return self._finish(
+                        state, status=STATUS_PLAN_SUBMITTED, reason=REASON_PLAN_SUBMITTED
+                    )
+                if state.stage_result is not None:
+                    # finish_stage 已收尾（阶段十五）：本次运行以阶段完成结束，
+                    # 同轮剩余工具调用不再执行，等待用户验收
+                    return self._finish(
+                        state, status=STATUS_STAGE_COMPLETE, reason=REASON_STAGE_FINISHED
+                    )
 
         # 防御：正常情况下循环内必然提前返回
         return self._finish(
@@ -1862,33 +2116,42 @@ class AgentRuntime:
                 display="参数不是合法的 JSON 对象，本次调用未执行。",
             )
         else:
-            try:
-                decision = await self._maybe_request_approval(
-                    state, entry, arguments, round_no, tc_id
-                )
-                if decision is not None and decision != DECISION_APPROVED:
-                    # 拒绝 / 超时：未进入执行入口，把拒绝结果回给模型
-                    state.rejected_tool_calls += 1
-                    outcome = self._rejection_outcome(decision, name, state.approval)
-                else:
-                    outcome = await self._dispatch(state, config, entry, arguments)
-            except asyncio.CancelledError:
-                # 取消时也给卡片一个明确终态，不得停留在“正在执行”
-                self._emit(
-                    state,
-                    {
-                        "type": TOOL_CALL_END,
-                        "round": round_no,
-                        "callId": tc_id,
-                        "toolName": name,
-                        "toolType": tool_type,
-                        "status": "cancelled",
-                        "durationMs": int((time.monotonic() - started) * 1000),
-                        "summary": "执行被取消",
-                        "result": None,
-                    },
-                )
-                raise
+            if entry.ref_key == SUBMIT_STAGE_PLAN_TOOL_NAME:
+                # 阶段计划工具（阶段化开发 v2）：不进入执行入口、不需要审批，
+                # 参数合格即记录计划并结束本次运行
+                outcome = self._submit_plan_outcome(state, arguments)
+            elif entry.ref_key == FINISH_STAGE_TOOL_NAME:
+                # 阶段收尾工具（阶段十五）：不进入执行入口、不需要审批，
+                # 参数合格即记录阶段信息（并读取交接文档内容展示）后结束本次运行
+                outcome = await self._finish_stage_outcome(state, arguments)
+            else:
+                try:
+                    decision = await self._maybe_request_approval(
+                        state, entry, arguments, round_no, tc_id
+                    )
+                    if decision is not None and decision != DECISION_APPROVED:
+                        # 拒绝 / 超时：未进入执行入口，把拒绝结果回给模型
+                        state.rejected_tool_calls += 1
+                        outcome = self._rejection_outcome(decision, name, state.approval)
+                    else:
+                        outcome = await self._dispatch(state, config, entry, arguments)
+                except asyncio.CancelledError:
+                    # 取消时也给卡片一个明确终态，不得停留在“正在执行”
+                    self._emit(
+                        state,
+                        {
+                            "type": TOOL_CALL_END,
+                            "round": round_no,
+                            "callId": tc_id,
+                            "toolName": name,
+                            "toolType": tool_type,
+                            "status": "cancelled",
+                            "durationMs": int((time.monotonic() - started) * 1000),
+                            "summary": "执行被取消",
+                            "result": None,
+                        },
+                    )
+                    raise
 
         duration_ms = int((time.monotonic() - started) * 1000)
         self._emit(
@@ -1918,22 +2181,149 @@ class AgentRuntime:
         )
         plan.run_messages.append({"role": "tool", "tool_call_id": tc_id, "content": outcome.context_text})
 
-    # ---- 工具执行审批（模块二） ----
+    # ---- 阶段计划与收尾工具（阶段化开发 v2 / 阶段十五） ----
 
-    def tool_requires_approval(self, entry: _ToolEntry, arguments: dict[str, Any]) -> bool:
-        """本次工具调用是否需要人工审批（模块二范围，黑名单之外的第二层）。
+    def _workspace_root(self, state: _RunState) -> Path:
+        """本次运行的工作区根目录：项目钉住目录或 Agent 工作区；无则全局默认。"""
+        config = state.config
+        if config is not None and config.tool_context is not None:
+            return config.tool_context.workspace_root
+        return settings.tool_workspace_dir
 
-        Shell 工具按动作区分（阶段十四）：执行（run）、后台启动（background）
-        与停止任务（stop）涉及环境操作需要审批；查列表（list）只读不需要。
-        文件读写工具的写入操作（覆盖 / 新建 / 追加）、edit_file 的全部操作
-        需要审批；读取、列目录、搜索、时间与 Skill 加载不需要。MCP 工具
-        本版不做审批。
+    def _submit_plan_outcome(self, state: _RunState, arguments: dict[str, Any]) -> _ToolOutcome:
+        """submit_stage_plan：校验阶段清单后记录计划；本次运行随后以
+        plan_submitted 结束。参数不合格按普通失败返回，模型可修正重调。"""
+        title = arguments.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return _ToolOutcome(
+                ok=False,
+                context_text="调用被拒绝：submit_stage_plan 缺少必填参数 title（非空字符串，项目标题）。请补全后重试。",
+                summary="阶段计划参数缺失：title",
+                display="缺少必填参数 title，本次调用未生效。",
+            )
+        stages = arguments.get("stages")
+        if not isinstance(stages, list) or not (PLAN_STAGES_MIN <= len(stages) <= PLAN_STAGES_MAX):
+            return _ToolOutcome(
+                ok=False,
+                context_text=(
+                    f"调用被拒绝：stages 必须是含 {PLAN_STAGES_MIN}–{PLAN_STAGES_MAX} 个阶段的数组，"
+                    "每项为 {\"name\", \"goal\"}（阶段名称与完成目标）。请修正后重试。"
+                ),
+                summary=f"阶段计划无效：{len(stages) if isinstance(stages, list) else '非数组'} 个阶段",
+                display=f"stages 参数无效（需要 {PLAN_STAGES_MIN}–{PLAN_STAGES_MAX} 项），本次调用未生效。",
+            )
+        cleaned: list[dict[str, str]] = []
+        for index, item in enumerate(stages, start=1):
+            if not isinstance(item, dict):
+                item = {}
+            name = item.get("name")
+            goal = item.get("goal")
+            if not isinstance(name, str) or not name.strip() or not isinstance(goal, str) or not goal.strip():
+                return _ToolOutcome(
+                    ok=False,
+                    context_text=(
+                        f"调用被拒绝：stages 第 {index} 项缺少 name 或 goal（非空字符串）。"
+                        "请补全每个阶段的名称与目标后重试。"
+                    ),
+                    summary=f"阶段计划第 {index} 项参数缺失",
+                    display=f"第 {index} 个阶段缺少 name 或 goal，本次调用未生效。",
+                )
+            cleaned.append({"name": name.strip(), "goal": goal.strip()})
+        state.plan_result = {"title": title.strip(), "stages": cleaned}
+        display = json.dumps(state.plan_result, ensure_ascii=False, indent=2)
+        return _ToolOutcome(
+            ok=True,
+            context_text=(
+                f"开发计划「{title.strip()}」已提交，共 {len(cleaned)} 个阶段。"
+                "本次运行结束，等待用户确认计划；用户确认后系统会为每个阶段"
+                "创建独立会话。不要继续执行任何工具或开始开发。"
+            ),
+            summary=f"已提交开发计划：{title.strip()}（{len(cleaned)} 个阶段）",
+            display=display,
+        )
+
+    def _read_handoff_content(self, state: _RunState, handoff_path: str) -> str:
+        """读取交接文档内容（结果卡片展示用）；读取失败不阻断收尾。"""
+        path = (self._workspace_root(state) / handoff_path).resolve()
+        try:
+            if not path.is_file():
+                return ""
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return text.strip()
+
+    async def _finish_stage_outcome(self, state: _RunState, arguments: dict[str, Any]) -> _ToolOutcome:
+        """finish_stage：校验四个参数后记录阶段信息，并读取工作区内的交接
+        文档内容放进结果卡片（阶段化开发 v2）；本次运行随后以 stage_complete
+        结束。参数不合格按普通失败返回，模型可修正重调。"""
+        values: dict[str, str] = {}
+        for key in ("stageName", "summary", "handoffPath", "nextStep"):
+            value = arguments.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return _ToolOutcome(
+                    ok=False,
+                    context_text=(
+                        f"调用被拒绝：finish_stage 缺少必填参数 {key}（非空字符串）。"
+                        "请补全阶段名称、成果概述、交接文档路径与下一步建议后重试。"
+                    ),
+                    summary=f"阶段收尾参数缺失：{key}",
+                    display=f"缺少必填参数 {key}，本次调用未生效。",
+                )
+            values[key] = value.strip()
+        # 交接文档内容（结果卡片展示用，不回传模型——文档就是模型刚写的）
+        handoff_content = await asyncio.to_thread(
+            self._read_handoff_content, state, values["handoffPath"]
+        )
+        state.stage_result = values
+        stage_name = values["stageName"]
+        display = json.dumps(values, ensure_ascii=False, indent=2)
+        if handoff_content:
+            clipped, truncated = _clip_text(handoff_content, HANDOFF_CONTENT_MAX_LENGTH)
+            label = "【交接文档内容】" if not truncated else "【交接文档内容（已截断）】"
+            display += f"\n\n{label}\n{clipped}"
+        return _ToolOutcome(
+            ok=True,
+            context_text=(
+                f"阶段「{stage_name}」已登记完成，本次运行结束，等待用户验收。"
+                "不要继续执行任何工具或输出新的计划，等待用户指示。"
+            ),
+            summary=f"阶段「{stage_name}」完成，等待用户验收",
+            display=display,
+        )
+
+    # ---- 工具执行审批（模块二 + 阶段十五档位） ----
+
+    def tool_requires_approval(self, state: _RunState, entry: _ToolEntry, arguments: dict[str, Any]) -> bool:
+        """本次工具调用是否需要人工审批（黑名单之外的第二层）。
+
+        审批档位（阶段十五）：
+        - off：一律不审批；
+        - standard：高风险动作审批——Shell 执行（run）/ 后台启动（background）/
+          停止任务（stop）需要审批，查列表（list）只读不需要；文件写入与
+          edit_file 需要审批；读取、列目录、搜索、时间与 Skill 加载不需要；
+        - strict：除时间查询外，全部内置工具调用都需要审批；
+        - 命中 Shell 命令白名单的调用免审批（黑名单仍然生效）；finish_stage
+          是收尾协议工具，任何档位都不审批；MCP 工具本版不做审批。
         """
         if entry.tool_type != TOOL_TYPE_BUILTIN:
             return False
+        if entry.ref_key in (FINISH_STAGE_TOOL_NAME, SUBMIT_STAGE_PLAN_TOOL_NAME):
+            # 协议工具（阶段收尾 / 计划提交）：任何档位都不审批
+            return False
+        config = state.config
+        level = config.approval_level if config is not None else APPROVAL_OFF
+        if level == APPROVAL_OFF:
+            return False
         if entry.ref_key == "builtin_shell":
+            if command_matches_whitelist(str(arguments.get("command") or ""), config.shell_whitelist):
+                return False
+            if level == APPROVAL_STRICT:
+                return True
             action = str(arguments.get("action") or "run").strip().lower()
             return action != "list"
+        if level == APPROVAL_STRICT and entry.ref_key != "builtin_current_time":
+            return True
         if entry.ref_key == "builtin_file":
             return arguments.get("action") == "write"
         if entry.ref_key == "builtin_edit_file":
@@ -1956,7 +2346,7 @@ class AgentRuntime:
         审批事件与工具事件一样进入运行记录，事后可在运行详情回放。
         """
         hooks = state.approval
-        if hooks is None or not self.tool_requires_approval(entry, arguments):
+        if hooks is None or not self.tool_requires_approval(state, entry, arguments):
             return None
         state.approval_count += 1
         request_id = f"apr-{state.approval_count}"

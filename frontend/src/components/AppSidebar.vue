@@ -1,8 +1,32 @@
 <script setup lang="ts">
+import { ref } from 'vue'
+
 interface MenuItem {
   path: string
   label: string
   icon: string
+}
+
+// 收起状态记忆（跨刷新）：收起后变 56px 图标栏，悬停菜单项仍可看名称
+const COLLAPSE_KEY = 'mini-agent:sidebar-collapsed'
+
+function readCollapsed(): boolean {
+  try {
+    return localStorage.getItem(COLLAPSE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+const collapsed = ref(readCollapsed())
+
+function toggleCollapsed(): void {
+  collapsed.value = !collapsed.value
+  try {
+    localStorage.setItem(COLLAPSE_KEY, collapsed.value ? '1' : '0')
+  } catch {
+    // 存不了就只在本页生效
+  }
 }
 
 const icon = (paths: string): string =>
@@ -57,7 +81,7 @@ const menus: MenuItem[] = [
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ 'is-collapsed': collapsed }">
     <div class="brand">
       <span class="brand-mark">m</span>
       <span class="brand-name">mini-agent</span>
@@ -74,5 +98,14 @@ const menus: MenuItem[] = [
         <span class="nav-label">{{ menu.label }}</span>
       </RouterLink>
     </nav>
+    <button
+      class="collapse-toggle"
+      type="button"
+      :title="collapsed ? '展开侧边栏' : '收起侧边栏'"
+      @click="toggleCollapsed"
+    >
+      <span class="toggle-icon" aria-hidden="true">{{ collapsed ? '»' : '«' }}</span>
+      <span v-if="!collapsed" class="toggle-label">收起</span>
+    </button>
   </aside>
 </template>

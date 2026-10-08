@@ -31,11 +31,15 @@ import {
   createChatSession as apiCreateSession,
   decideChatApproval as apiDecideApproval,
   getChatMessages as apiGetMessages,
+  getStageProject as apiGetStageProject,
   listChatSessions,
+  nextStageProject as apiNextStageProject,
   openChatEventStream,
   selectChatAgent as apiSelectAgent,
   sendChatMessage as apiSendMessage,
+  startStageProject as apiStartStageProject,
   stopChatGeneration as apiStopGeneration,
+  summarizeStageProject as apiSummarizeStageProject,
   type ApprovalDecisionStatus,
   type ChatEvent,
   type ChatGeneration,
@@ -45,6 +49,7 @@ import {
   type GenerationPhase,
   type GenerationTimelineItem,
   type RunError,
+  type StageProject,
   type ToolResultPayload,
   type ToolType,
 } from '../api/chat'
@@ -189,6 +194,8 @@ interface ChatState {
   streams: Record<number, AbortController>
   /** 事件流意外断开的连续重连次数（成功收到事件即清零） */
   reconnectAttempts: Record<number, number>
+  /** 阶段项目（阶段化开发 v2）：按项目 id 缓存，随会话切换按需拉取 */
+  stageProjects: Record<number, StageProject>
 }
 
 const MAX_RECONNECT_ATTEMPTS = 3
@@ -386,6 +393,7 @@ export const useChatStore = defineStore('chat', {
     orphanSegments: {},
     streams: {},
     reconnectAttempts: {},
+    stageProjects: {},
   }),
   getters: {
     activeSession(state): ChatSessionSummary | null {
@@ -523,6 +531,58 @@ export const useChatStore = defineStore('chat', {
       }
       const updated = await apiSelectAgent(sessionId, agentId)
       this.syncSession(updated)
+    },
+
+    /** 拉取阶段项目详情（失败时返回 null，页面提示为空态）。 */
+    async fetchStageProject(projectId: number): Promise<StageProject | null> {
+      try {
+        const project = await apiGetStageProject(projectId)
+        this.stageProjects[projectId] = project
+        return project
+      } catch {
+        return null
+      }
+    },
+
+    /** 确认计划并开始阶段 1：后端自动新建阶段会话，前端切换过去。
+     *  失败（状态已被推进等）时也刷新一次项目卡，让按钮与真实状态对齐。 */
+    async startStageProject(projectId: number): Promise<void> {
+      try {
+        const result = await apiStartStageProject(projectId)
+        this.stageProjects[projectId] = result.project
+        await this.fetchSessions()
+        await this.selectSession(result.session.id)
+      } catch (error) {
+        void this.fetchStageProject(projectId)
+        throw error
+      }
+    },
+
+    /** 进入下一阶段：后端自动新建阶段会话（带上一阶段交接），前端切换过去。
+     *  全部阶段已完成时会 409：刷新项目卡后按钮会变为「生成项目汇总」。 */
+    async nextStageProject(projectId: number): Promise<void> {
+      try {
+        const result = await apiNextStageProject(projectId)
+        this.stageProjects[projectId] = result.project
+        await this.fetchSessions()
+        await this.selectSession(result.session.id)
+      } catch (error) {
+        void this.fetchStageProject(projectId)
+        throw error
+      }
+    },
+
+    /** 生成项目汇总：后端新建独立汇总会话，前端切换过去。 */
+    async summarizeStageProject(projectId: number): Promise<void> {
+      try {
+        const result = await apiSummarizeStageProject(projectId)
+        this.stageProjects[projectId] = result.project
+        await this.fetchSessions()
+        await this.selectSession(result.session.id)
+      } catch (error) {
+        void this.fetchStageProject(projectId)
+        throw error
+      }
     },
 
     // ---- SSE 订阅与事件处理 ----

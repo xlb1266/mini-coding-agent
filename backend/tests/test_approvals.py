@@ -53,23 +53,91 @@ def builtin_entry(key: str) -> agent_runtime_module._ToolEntry:
     )
 
 
+def make_state(
+    approval_level: str = "standard", shell_whitelist: str = ""
+) -> agent_runtime_module._RunState:
+    """构造审批判定用的运行状态：只有档位与白名单是变量。"""
+    from app.services.context_compaction import CompactionSettings, compute_capacity
+
+    compaction = CompactionSettings(
+        enabled=True, threshold_percent=80, keep_rounds=4, summary_target_tokens=1000
+    )
+    state = agent_runtime_module._RunState(run_id="t", on_event=None)
+    state.config = agent_runtime_module._LoadedConfig(
+        agent_id=1,
+        agent_name="x",
+        system_prompt="",
+        model_base_url="",
+        model_identifier="m",
+        context_length=32768,
+        max_output_tokens=512,
+        temperature=0.0,
+        api_key=None,
+        max_rounds=5,
+        tool_rows={},
+        skills=[],
+        mcp_servers=[],
+        compaction=compaction,
+        capacity=compute_capacity(compaction, 32768, 512),
+        approval_level=approval_level,
+        shell_whitelist=agent_runtime_module.parse_shell_whitelist(shell_whitelist),
+    )
+    return state
+
+
 class TestRequiresApprovalScope:
-    def test_shell_file_write_and_edit_require_approval(self, runtime: AgentRuntime) -> None:
-        assert runtime.tool_requires_approval(builtin_entry("builtin_shell"), {"command": "ls"})
+    def test_standard_level_high_risk_actions(self, runtime: AgentRuntime) -> None:
+        state = make_state("standard")
+        assert runtime.tool_requires_approval(state, builtin_entry("builtin_shell"), {"command": "ls"})
         assert runtime.tool_requires_approval(
-            builtin_entry("builtin_file"), {"action": "write", "path": "a.txt"}
+            state, builtin_entry("builtin_file"), {"action": "write", "path": "a.txt"}
         )
-        assert runtime.tool_requires_approval(builtin_entry("builtin_edit_file"), {"path": "a.txt"})
+        assert runtime.tool_requires_approval(state, builtin_entry("builtin_edit_file"), {"path": "a.txt"})
+        # 只读动作照旧免审
+        assert not runtime.tool_requires_approval(state, builtin_entry("builtin_shell"), {"action": "list"})
+
+    def test_off_level_never_requires_approval(self, runtime: AgentRuntime) -> None:
+        state = make_state("off")
+        assert not runtime.tool_requires_approval(state, builtin_entry("builtin_shell"), {"command": "ls"})
+        assert not runtime.tool_requires_approval(
+            state, builtin_entry("builtin_file"), {"action": "write", "path": "a.txt"}
+        )
+
+    def test_strict_level_covers_all_but_time(self, runtime: AgentRuntime) -> None:
+        state = make_state("strict")
+        assert runtime.tool_requires_approval(state, builtin_entry("builtin_shell"), {"action": "list"})
+        assert runtime.tool_requires_approval(
+            state, builtin_entry("builtin_file"), {"action": "read", "path": "a.txt"}
+        )
+        assert runtime.tool_requires_approval(state, builtin_entry("builtin_list_dir"), {"path": "."})
+        assert runtime.tool_requires_approval(state, builtin_entry("builtin_grep"), {"pattern": "x"})
+        assert not runtime.tool_requires_approval(state, builtin_entry("builtin_current_time"), {})
+
+    def test_shell_whitelist_skips_approval(self, runtime: AgentRuntime) -> None:
+        state = make_state("standard", shell_whitelist="uv run pytest\ngit status")
+        assert not runtime.tool_requires_approval(
+            state, builtin_entry("builtin_shell"), {"command": "uv run pytest -q"}
+        )
+        assert not runtime.tool_requires_approval(
+            state, builtin_entry("builtin_shell"), {"command": "git status --short"}
+        )
+        # 未命中白名单的命令照旧审批；白名单不影响文件写入审批
+        assert runtime.tool_requires_approval(state, builtin_entry("builtin_shell"), {"command": "npm test"})
+        assert runtime.tool_requires_approval(
+            state, builtin_entry("builtin_file"), {"action": "write", "path": "a.txt"}
+        )
 
     def test_read_only_tools_do_not_require_approval(self, runtime: AgentRuntime) -> None:
+        state = make_state("standard")
         assert not runtime.tool_requires_approval(
-            builtin_entry("builtin_file"), {"action": "read", "path": "a.txt"}
+            state, builtin_entry("builtin_file"), {"action": "read", "path": "a.txt"}
         )
-        assert not runtime.tool_requires_approval(builtin_entry("builtin_list_dir"), {"path": "."})
-        assert not runtime.tool_requires_approval(builtin_entry("builtin_grep"), {"pattern": "x"})
-        assert not runtime.tool_requires_approval(builtin_entry("builtin_current_time"), {})
+        assert not runtime.tool_requires_approval(state, builtin_entry("builtin_list_dir"), {"path": "."})
+        assert not runtime.tool_requires_approval(state, builtin_entry("builtin_grep"), {"pattern": "x"})
+        assert not runtime.tool_requires_approval(state, builtin_entry("builtin_current_time"), {})
 
     def test_mcp_and_skill_do_not_require_approval(self, runtime: AgentRuntime) -> None:
+        state = make_state("standard")
         mcp = agent_runtime_module._ToolEntry(
             name="mcp1_x", tool_type="mcp", display_name="x", descriptor={},
             server_id=1, remote_name="x",
@@ -77,8 +145,13 @@ class TestRequiresApprovalScope:
         skill = agent_runtime_module._ToolEntry(
             name="load_skill", tool_type="skill", display_name="加载 Skill", descriptor={}
         )
-        assert not runtime.tool_requires_approval(mcp, {})
-        assert not runtime.tool_requires_approval(skill, {"skill_id": "demo"})
+        assert not runtime.tool_requires_approval(state, mcp, {})
+        assert not runtime.tool_requires_approval(state, skill, {"skill_id": "demo"})
+
+    def test_finish_stage_never_requires_approval(self, runtime: AgentRuntime) -> None:
+        state = make_state("strict")
+        entry = builtin_entry("finish_stage")
+        assert not runtime.tool_requires_approval(state, entry, {"stageName": "阶段一"})
 
 
 # ---- 运行内审批流程 ----
@@ -104,7 +177,9 @@ class TestApprovalFlow:
     def test_approved_call_executes(
         self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        agent_id = seed_agent(factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path))
+        agent_id = seed_agent(
+            factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path), approval_level="standard"
+        )
         requests: list[dict] = []
 
         async def approve(info: dict) -> str:
@@ -147,7 +222,9 @@ class TestApprovalFlow:
     def test_rejected_call_returns_rejection_to_model(
         self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        agent_id = seed_agent(factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path))
+        agent_id = seed_agent(
+            factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path), approval_level="standard"
+        )
 
         async def reject(info: dict) -> str:
             return "rejected"
@@ -182,7 +259,9 @@ class TestApprovalFlow:
     def test_timeout_is_treated_as_rejection(
         self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        agent_id = seed_agent(factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path))
+        agent_id = seed_agent(
+            factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path), approval_level="standard"
+        )
 
         async def hang(info: dict) -> str:
             await asyncio.sleep(10)
@@ -214,7 +293,9 @@ class TestApprovalFlow:
     def test_cancel_while_waiting_settles_and_cancels_run(
         self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        agent_id = seed_agent(factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path))
+        agent_id = seed_agent(
+            factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path), approval_level="standard"
+        )
 
         async def hang(info: dict) -> str:
             await asyncio.sleep(10)
@@ -256,7 +337,9 @@ class TestApprovalFlow:
         self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
         """评测路径（无审批钩子）：同样的高风险调用自动执行，不产生审批事件。"""
-        agent_id = seed_agent(factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path))
+        agent_id = seed_agent(
+            factory, box, tool_keys=("builtin_shell",), workspace_dir=str(tmp_path), approval_level="standard"
+        )
         transport = ScriptedTransport(shell_responses())
         install(monkeypatch, transport)
 
@@ -274,7 +357,9 @@ class TestApprovalFlow:
     def test_read_only_tool_skips_approval_even_with_hooks(
         self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        agent_id = seed_agent(factory, box, tool_keys=("builtin_list_dir",), workspace_dir=str(tmp_path))
+        agent_id = seed_agent(
+            factory, box, tool_keys=("builtin_list_dir",), workspace_dir=str(tmp_path), approval_level="standard"
+        )
         calls: list[dict] = []
 
         async def approve(info: dict) -> str:

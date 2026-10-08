@@ -17,7 +17,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base
@@ -30,7 +30,6 @@ MESSAGE_ROLES = (ROLE_USER, ROLE_ASSISTANT)
 STATUS_COMPLETED = "completed"
 STATUS_INCOMPLETE = "incomplete"
 MESSAGE_STATUSES = (STATUS_COMPLETED, STATUS_INCOMPLETE)
-
 
 class ChatSession(Base):
     """一次多轮对话会话。"""
@@ -50,6 +49,23 @@ class ChatSession(Base):
     summary_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 已压缩边界：seq 不大于该值的消息已被摘要覆盖，不再原文进入上下文
     summary_boundary_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # ---- 阶段化开发（阶段十五）----
+    # True 表示上一阶段已完成（模型调用了 finish_stage），等待用户验收后继续
+    awaiting_acceptance: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 上一阶段的交接摘要 JSON（stageName / summary / handoffPath / nextStep）；无则为 NULL
+    stage_summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ---- 阶段化开发 v2（阶段十六）：项目下的会话归属 ----
+    # 所属阶段项目；普通会话为 NULL
+    project_id: Mapped[int | None] = mapped_column(
+        ForeignKey("stage_projects.id"), nullable=True, index=True
+    )
+    # 会话在项目中的角色：plan（规划）/ stage（阶段）/ summary（汇总）；普通会话为 NULL
+    project_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 本会话负责的项目阶段序号（1-based）；规划与汇总会话为 NULL
+    stage_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 项目钉住的工作区目录：项目下的会话创建时继承，Runtime 以本目录优先
+    # 执行（保证多会话操作同一工作区）；普通会话为 NULL，跟随 Agent 配置
+    workspace_dir: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     messages: Mapped[list["ChatMessage"]] = relationship(
         back_populates="session",

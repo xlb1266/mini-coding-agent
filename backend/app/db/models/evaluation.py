@@ -168,6 +168,10 @@ class EvalTaskResult(Base):
     actual_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 过程评分（阶段十五）：LLM Judge 对执行过程合理性的打分（0-100）与理由；
+    # 未启用 / 未产出时为 NULL
+    process_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    process_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 关联的目标 Agent Run（agent_runs.id 与 run_uid）
     run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     run_uid: Mapped[str | None] = mapped_column(String(32), nullable=True)

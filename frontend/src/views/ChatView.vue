@@ -6,6 +6,7 @@ import PageHeader from '../components/PageHeader.vue'
 import ApprovalCard from '../components/ApprovalCard.vue'
 import CompactionCard from '../components/CompactionCard.vue'
 import MarkdownContent from '../components/MarkdownContent.vue'
+import ProjectStagesCard from '../components/ProjectStagesCard.vue'
 import ThinkingCard from '../components/ThinkingCard.vue'
 import ToolGroupCard from '../components/ToolGroupCard.vue'
 import { useAgentsStore } from '../stores/agents'
@@ -135,6 +136,57 @@ async function handleSend(): Promise<void> {
     actionError.value = errorMessage(error)
   }
 }
+
+// ---- 阶段项目（阶段化开发 v2）----
+
+/** 当前会话所属的阶段项目（项目会话才拉取）。 */
+const project = computed(() => {
+  const projectId = session.value?.projectId
+  return projectId ? chatStore.stageProjects[projectId] ?? null : null
+})
+
+const projectBusy = ref(false)
+
+// 切换会话就刷新项目卡：同一项目内切换阶段会话时 projectId 不变，
+// 只 watch projectId 会漏掉阶段收尾后的状态推进
+watch(
+  () => [session.value?.id, session.value?.projectId] as const,
+  ([, projectId]) => {
+    if (projectId) void chatStore.fetchStageProject(projectId)
+  },
+  { immediate: true },
+)
+
+// 生成结束（阶段收尾 / 计划上报会推进项目状态）后刷新项目卡
+watch(isGenerating, (generating, previous) => {
+  const projectId = session.value?.projectId
+  if (previous && !generating && projectId) void chatStore.fetchStageProject(projectId)
+})
+
+/** 项目推进（开始 / 下一阶段 / 汇总）：后端自动新建会话并切换过去。 */
+async function runProjectAction(action: 'start' | 'next' | 'summary'): Promise<void> {
+  const projectId = session.value?.projectId
+  if (!projectId || projectBusy.value) return
+  projectBusy.value = true
+  actionError.value = ''
+  try {
+    if (action === 'start') {
+      await chatStore.startStageProject(projectId)
+    } else if (action === 'next') {
+      await chatStore.nextStageProject(projectId)
+    } else {
+      await chatStore.summarizeStageProject(projectId)
+    }
+  } catch (error) {
+    actionError.value = errorMessage(error)
+  } finally {
+    projectBusy.value = false
+  }
+}
+
+// ---- 阶段完成提示 ----
+// 不再做单独的悬浮横幅：阶段成果概述在模型回复正文里，
+// 交接文档全文在 finish_stage 工具卡展开区；推进按钮在上方项目卡里。
 
 async function handleStop(): Promise<void> {
   if (!session.value || stopPending.value) return
@@ -374,6 +426,20 @@ function formatSessionTime(iso: string): string {
             <span v-if="isGenerating" class="generating-badge">正在{{ phaseLabel }}…</span>
             <span v-else-if="agentMissing" class="agent-missing">当前会话未选择 Agent，发送前请先选择</span>
           </header>
+
+          <!-- 阶段项目清单卡（阶段化开发 v2）：项目会话常显，推进按钮按状态出现 -->
+          <div v-if="project" class="project-strip">
+            <ProjectStagesCard
+              :project="project"
+              :session-role="session.projectRole ?? null"
+              :awaiting-acceptance="!!session.awaitingAcceptance"
+              :busy="projectBusy || isGenerating"
+              @start="runProjectAction('start')"
+              @next="runProjectAction('next')"
+              @summary="runProjectAction('summary')"
+              @open-session="handleSelectSession"
+            />
+          </div>
 
           <div ref="messagesEl" class="messages" @scroll="handleScroll">
             <p v-if="messages.length === 0" class="messages-empty">输入消息开始对话，回复会实时显示在这里。</p>
@@ -821,6 +887,14 @@ function formatSessionTime(iso: string): string {
   display: flex;
   flex-direction: column;
   max-width: 76%;
+}
+
+/* ---- 回到最新消息 ---- */
+
+/* ---- 阶段项目清单卡（阶段化开发 v2） ---- */
+
+.project-strip {
+  padding: 8px 14px 0;
 }
 
 /* ---- 回到最新消息 ---- */

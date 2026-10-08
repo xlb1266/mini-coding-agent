@@ -11,6 +11,8 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from pydantic.alias_generators import to_camel
 
+from app.db.models.agent import APPROVAL_LEVELS, AUTONOMY_MODES
+
 # 字段长度限制（与数据库列宽一致）
 NAME_MAX_LENGTH = 64
 DESCRIPTION_MAX_LENGTH = 512
@@ -40,6 +42,9 @@ BINDING_ITEMS_MAX = 100
 # 工作区目录长度上限（与数据库列宽一致）；填写时必须是已存在的绝对路径目录
 WORKSPACE_DIR_MAX_LENGTH = 512
 
+# Shell 命令白名单长度上限（Text 列，宽松限制防误传超长文本）
+SHELL_WHITELIST_MAX_LENGTH = 8000
+
 
 class CamelModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
@@ -61,14 +66,18 @@ class _CompactionFieldsMixin(CamelModel):
 
 
 class _WorkspaceFieldsMixin(CamelModel):
-    """工作区与审批字段：创建与更新共用同一组约束与默认值。
+    """工作区与执行治理字段：创建与更新共用同一组约束与默认值。
 
     workspace_dir 留空合法（用全局默认目录）；填写时必须是已存在的
     绝对路径目录，跨字段校验在路由层完成（isabs + isdir）。
+    approval_level / autonomy_mode 的取值校验也在路由层完成（返回
+    字段级中文提示）；shell_whitelist 为换行或逗号分隔的命令前缀。
     """
 
     workspace_dir: Annotated[str, Field(default="", max_length=WORKSPACE_DIR_MAX_LENGTH)] = ""
-    require_approval: bool = False
+    approval_level: str = "off"
+    autonomy_mode: str = "stage_confirm"
+    shell_whitelist: Annotated[str, Field(default="", max_length=SHELL_WHITELIST_MAX_LENGTH)] = ""
 
 
 class AgentCreateRequest(_CompactionFieldsMixin, _WorkspaceFieldsMixin, CamelModel):
@@ -125,7 +134,9 @@ class AgentOut(CamelModel):
     prompt_version: int
     max_rounds: int
     workspace_dir: str
-    require_approval: bool
+    approval_level: str
+    autonomy_mode: str
+    shell_whitelist: str
     auto_compact: bool
     compact_threshold: int
     compact_keep_rounds: int
@@ -163,7 +174,9 @@ FIELD_ERROR_MESSAGES: dict[str, str] = {
     "modelId": "请选择一个已配置的模型",
     "maxRounds": "最大执行轮数必须为 1–100 的正整数",
     "workspaceDir": "工作区目录必须是已存在的绝对路径目录，或留空使用默认目录",
-    "requireApproval": "审批开关只能是开启或关闭",
+    "approvalLevel": "审批档位只能是 off、standard 或 strict",
+    "autonomyMode": "自主档位只能是 stage_confirm 或 autonomous",
+    "shellWhitelist": "命令白名单内容过长（上限 8000 字符）",
     "autoCompact": "自动压缩只能是开启或关闭",
     "compactThreshold": "触发比例必须为 10–95 的整数（百分比）",
     "compactKeepRounds": "保留最近对话轮数必须为 1–50 的正整数",

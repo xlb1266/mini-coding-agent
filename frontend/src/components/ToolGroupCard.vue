@@ -2,12 +2,15 @@
 /** 工具调用组卡片：默认只显示“使用N个工具”一行，点击才展开组内的一次次工具调用。
  *
  * 组内子卡片仍是收起的，需要再点一次才看参数与结果——与轨迹区
- * “组 → 单次调用”的两级折叠保持一致。任一工具仍在执行时标题行图标闪动，
- * 组内有失败时在标题行用文字点明（不只靠颜色）。
+ * “组 → 单次调用”的两级折叠保持一致。文件写入类调用在组内聚合为
+ * “修改了 N 个文件”一张卡（阶段十五 demo，默认同样收起）。
+ * 任一工具仍在执行时标题行图标闪动，组内有失败时在标题行用文字点明。
  */
 import { computed, ref } from 'vue'
 
+import FileWriteGroupCard from './FileWriteGroupCard.vue'
 import ToolCallCard from './ToolCallCard.vue'
+import { partitionGroupTools } from '../views/chat-format'
 import type { ToolActivity } from '../stores/chat'
 
 const props = defineProps<{ tools: ToolActivity[] }>()
@@ -15,6 +18,8 @@ const emit = defineEmits<{ (e: 'toggle', card: HTMLElement): void }>()
 
 const rootEl = ref<HTMLElement | null>(null)
 const expanded = ref(false)
+
+const nodes = computed(() => partitionGroupTools(props.tools))
 
 const running = computed(() => props.tools.some((tool) => tool.status === 'running'))
 const failedCount = computed(
@@ -49,12 +54,18 @@ function toggle(): void {
       <span class="tool-chevron" :class="{ 'is-open': expanded }" aria-hidden="true">▾</span>
     </button>
     <div v-if="expanded" class="tool-group-body">
-      <ToolCallCard
-        v-for="tool in tools"
-        :key="tool.callId"
-        :tool="tool"
-        @toggle="(card: HTMLElement) => emit('toggle', card)"
-      />
+      <template v-for="(node, index) in nodes" :key="node.kind === 'tool' ? node.tool.callId : `writes-${index}`">
+        <FileWriteGroupCard
+          v-if="node.kind === 'writes'"
+          :entries="node.entries"
+          @toggle="(card: HTMLElement) => emit('toggle', card)"
+        />
+        <ToolCallCard
+          v-else
+          :tool="node.tool"
+          @toggle="(card: HTMLElement) => emit('toggle', card)"
+        />
+      </template>
     </div>
   </div>
 </template>

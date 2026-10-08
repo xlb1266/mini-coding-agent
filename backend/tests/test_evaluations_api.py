@@ -54,6 +54,7 @@ def seed_agent(db, model_id: int, name: str = "被测 Agent") -> int:
         prompt_version=1,
         model_id=model_id,
         max_rounds=5,
+        autonomy_mode="autonomous",
         created_at=now,
         updated_at=now,
     )

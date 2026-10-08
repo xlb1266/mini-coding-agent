@@ -17,6 +17,8 @@ import {
   findMissingBindings,
   COMPACT_KEEP_ROUNDS_MAX,
   COMPACT_KEEP_ROUNDS_MIN,
+  APPROVAL_LEVEL_OPTIONS,
+  AUTONOMY_MODE_OPTIONS,
   COMPACT_SUMMARY_TOKENS_MAX,
   COMPACT_SUMMARY_TOKENS_MIN,
   COMPACT_THRESHOLD_MAX,
@@ -134,7 +136,9 @@ async function fillFromDetail(id: number): Promise<void> {
     values.modelId = detail.model === null ? '' : String(detail.model.id)
     values.maxRounds = String(detail.maxRounds)
     values.workspaceDir = detail.workspaceDir
-    values.requireApproval = detail.requireApproval
+    values.approvalLevel = detail.approvalLevel
+    values.autonomyMode = detail.autonomyMode
+    values.shellWhitelist = detail.shellWhitelist
     values.autoCompact = detail.autoCompact
     values.compactThreshold = String(detail.compactThreshold)
     values.compactKeepRounds = String(detail.compactKeepRounds)
@@ -284,15 +288,43 @@ function bindingBadge(binding: AgentBindingRef): string {
       </div>
 
       <div class="form-field approval-section">
-        <label class="compact-toggle">
-          <input v-model="values.requireApproval" type="checkbox" />
-          执行审批
-        </label>
+        <label>审批档位</label>
+        <select v-model="values.approvalLevel" class="governance-select">
+          <option v-for="option in APPROVAL_LEVEL_OPTIONS" :key="option.value" :value="option.value">
+            {{ option.label }}
+          </option>
+        </select>
         <p class="field-hint">
-          开启后，Agent 执行 Shell 命令、写入文件（覆盖 / 新建 / 追加）或编辑文件（edit_file）前会暂停，
-          在聊天页展示审批卡片，等你批准或拒绝；拒绝与超时（默认 300 秒）都会把结果告知模型。
-          读取、列目录、搜索等只读操作不需要审批。默认关闭。
+          当前档位：{{ APPROVAL_LEVEL_OPTIONS.find((o) => o.value === values.approvalLevel)?.hint }}。
+          命中审批的调用会暂停并在聊天页展示审批卡片，等你批准或拒绝；拒绝与超时（默认 300 秒）都会把结果告知模型。
         </p>
+        <p v-if="errors.approvalLevel" class="field-error">{{ errors.approvalLevel }}</p>
+        <label class="governance-sublabel">Shell 命令白名单（可选）</label>
+        <textarea
+          v-model="values.shellWhitelist"
+          class="governance-textarea"
+          rows="3"
+          placeholder="每行一条命令前缀，命中免审批。例如：&#10;uv run pytest&#10;git status"
+        />
+        <p class="field-hint">
+          按行或逗号分隔的命令前缀；Agent 执行的 Shell 命令以白名单前缀开头时跳过审批直接执行。
+          危险命令黑名单仍然生效，白名单只跳过人工审批这一层。
+        </p>
+        <p v-if="errors.shellWhitelist" class="field-error">{{ errors.shellWhitelist }}</p>
+      </div>
+
+      <div class="form-field approval-section">
+        <label>自主档位</label>
+        <select v-model="values.autonomyMode" class="governance-select">
+          <option v-for="option in AUTONOMY_MODE_OPTIONS" :key="option.value" :value="option.value">
+            {{ option.label }}
+          </option>
+        </select>
+        <p class="field-hint">
+          当前档位：{{ AUTONOMY_MODE_OPTIONS.find((o) => o.value === values.autonomyMode)?.hint }}。
+          阶段确认模式下 Agent 会按「开发 → 自检 → 交接文档 → finish_stage」收尾，聊天页出现验收横幅。
+        </p>
+        <p v-if="errors.autonomyMode" class="field-error">{{ errors.autonomyMode }}</p>
       </div>
 
       <div class="form-field compact-section">
@@ -449,6 +481,44 @@ function bindingBadge(binding: AgentBindingRef): string {
 </template>
 
 <style scoped>
+/* ---- 执行治理（审批档位 / 白名单 / 自主档位） ---- */
+.governance-select {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+
+.governance-select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.governance-textarea {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.governance-textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.governance-sublabel {
+  margin-top: 8px;
+}
+
 .form-loading {
   padding: 24px 0;
   text-align: center;

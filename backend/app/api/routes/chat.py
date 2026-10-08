@@ -30,6 +30,16 @@ from app.core.secret_box import SecretBox, SecretBoxError, get_secret_box
 from app.db.models.agent import Agent
 from app.db.models.chat import ChatMessage, ChatSession, ROLE_USER, STATUS_COMPLETED
 from app.db.models.model_config import ModelConfig
+from app.db.models.stage_project import (
+    PROJECT_AWAITING_START,
+    PROJECT_AWAITING_SUMMARY,
+    PROJECT_IN_PROGRESS,
+    PROJECT_ROLE_PLAN,
+    PROJECT_ROLE_STAGE,
+    PROJECT_ROLE_SUMMARY,
+    PROJECT_SUMMARIZING,
+    StageProject,
+)
 from app.db.session import get_db, get_session_factory
 from app.schemas.chat import (
     DEFAULT_SESSION_TITLE,
@@ -46,6 +56,9 @@ from app.schemas.chat import (
     ChatSessionCreateRequest,
     ChatSessionOut,
     ChatStopResultOut,
+    StageProjectOperationOut,
+    StageProjectOut,
+    StageProjectStageOut,
 )
 from app.api.routes.skills import get_skills_dir
 from app.services.approvals import approval_registry
@@ -91,12 +104,25 @@ def _session_out(db: Session, session: ChatSession) -> ChatSessionOut:
     if session.agent_id is not None:
         agent = db.get(Agent, session.agent_id)
         agent_name = agent.name if agent is not None else None
+    stage_summary: dict | None = None
+    if session.stage_summary_json:
+        try:
+            parsed = json.loads(session.stage_summary_json)
+            if isinstance(parsed, dict):
+                stage_summary = parsed
+        except json.JSONDecodeError:
+            stage_summary = None
     return ChatSessionOut(
         id=session.id,
         title=session.title,
         agent_id=session.agent_id,
         agent_name=agent_name,
         is_generating=generation_manager.is_generating(session.id),
+        awaiting_acceptance=bool(session.awaiting_acceptance),
+        stage_summary=stage_summary,
+        project_id=session.project_id,
+        project_role=session.project_role,
+        stage_index=session.stage_index,
         created_at=session.created_at,
         updated_at=session.updated_at,
     )
@@ -108,18 +134,33 @@ def list_sessions(db: Session = Depends(get_db)) -> list[ChatSessionOut]:
     sessions = db.query(ChatSession).order_by(ChatSession.updated_at.desc(), ChatSession.id.desc()).all()
     agent_names = _agent_names(db, {s.agent_id for s in sessions if s.agent_id is not None})
     generating = generation_manager.generating_session_ids()
-    return [
-        ChatSessionOut(
-            id=s.id,
-            title=s.title,
-            agent_id=s.agent_id,
-            agent_name=agent_names.get(s.agent_id) if s.agent_id is not None else None,
-            is_generating=s.id in generating,
-            created_at=s.created_at,
-            updated_at=s.updated_at,
+    outs: list[ChatSessionOut] = []
+    for s in sessions:
+        stage_summary: dict | None = None
+        if s.stage_summary_json:
+            try:
+                parsed = json.loads(s.stage_summary_json)
+                if isinstance(parsed, dict):
+                    stage_summary = parsed
+            except json.JSONDecodeError:
+                stage_summary = None
+        outs.append(
+            ChatSessionOut(
+                id=s.id,
+                title=s.title,
+                agent_id=s.agent_id,
+                agent_name=agent_names.get(s.agent_id) if s.agent_id is not None else None,
+                is_generating=s.id in generating,
+                awaiting_acceptance=bool(s.awaiting_acceptance),
+                stage_summary=stage_summary,
+                project_id=s.project_id,
+                project_role=s.project_role,
+                stage_index=s.stage_index,
+                created_at=s.created_at,
+                updated_at=s.updated_at,
+            )
         )
-        for s in sessions
-    ]
+    return outs
 
 
 @router.post("/sessions", status_code=201)
@@ -213,24 +254,21 @@ def select_session_agent(
     return _session_out(db, session)
 
 
-@router.post("/sessions/{session_id}/messages", status_code=201)
-async def send_message(
-    session_id: int,
-    payload: ChatSendRequest,
-    db: Session = Depends(get_db),
-    session_factory: sessionmaker = Depends(get_session_factory),
-    box: SecretBox = Depends(get_secret_box),
-    skills_dir: Path = Depends(get_skills_dir),
+def start_session_generation(
+    db: Session,
+    session: ChatSession,
+    content: str,
+    session_factory: sessionmaker,
+    box: SecretBox,
+    skills_dir: Path,
 ) -> ChatSendResultOut:
-    """保存用户消息并启动后台运行；校验失败时不保存、不请求模型。"""
-    session = _get_session_or_404(db, session_id)
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(
-            status_code=FIELD_ERROR_STATUS,
-            detail={"message": "消息内容不能为空", "fields": {"content": "消息内容不能为空"}},
-        )
+    """校验并启动一次后台生成：保存用户消息后交由统一 Runtime 执行。
 
+    send_message 与阶段项目的自动首条消息（开始 / 下一阶段 / 生成汇总）
+    共用；校验失败时不保存、不请求模型。校验顺序：生成中 → Agent 与模型
+    可用 → 密钥可解密 → 上下文容量预估。
+    """
+    session_id = session.id
     if generation_manager.is_generating(session_id):
         raise HTTPException(status_code=CONFLICT_STATUS, detail="当前会话正在生成回复，请等待完成或先停止生成")
 
@@ -304,13 +342,20 @@ async def send_message(
     db.add(user_message)
     if session.title == DEFAULT_SESSION_TITLE:
         session.title = make_session_title(content)
+    # 用户继续发消息即视为接受了上一阶段的结果：清除等待验收横幅
+    #（项目会话进入下一阶段由项目接口负责，普通阶段会话靠继续对话推进）
+    if session.awaiting_acceptance:
+        session.awaiting_acceptance = False
+        session.stage_summary_json = None
     session.updated_at = now
     db.commit()
     db.refresh(user_message)
     db.refresh(session)
 
     # ---- 启动后台运行（上下文含刚保存的这条用户消息，只计一次）----
-    # 历史只带压缩边界之后的消息；被摘要覆盖的原文不再重复进入上下文
+    # 历史只带压缩边界之后的消息；被摘要覆盖的原文不再重复进入上下文。
+    # 工作区覆盖（阶段化开发 v2）：项目下的会话把项目钉住的目录写上会话，
+    # Runtime 优先使用，保证多会话操作同一工作区。
     boundary = session.summary_boundary_seq
     history = [
         {"role": item.role, "content": item.content, "seq": item.seq}
@@ -332,7 +377,8 @@ async def send_message(
         model_id=model.id,
         model_name=model.display_name,
         model_identifier=model.model_identifier,
-        require_approval=agent.require_approval,
+        approval_level=agent.approval_level,
+        workspace_dir=(session.workspace_dir or "").strip(),
     )
 
     started_run = generation_manager.get_run(session_id)
@@ -348,6 +394,26 @@ async def send_message(
     )
 
 
+@router.post("/sessions/{session_id}/messages", status_code=201)
+async def send_message(
+    session_id: int,
+    payload: ChatSendRequest,
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker = Depends(get_session_factory),
+    box: SecretBox = Depends(get_secret_box),
+    skills_dir: Path = Depends(get_skills_dir),
+) -> ChatSendResultOut:
+    """保存用户消息并启动后台运行；校验失败时不保存、不请求模型。"""
+    session = _get_session_or_404(db, session_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(
+            status_code=FIELD_ERROR_STATUS,
+            detail={"message": "消息内容不能为空", "fields": {"content": "消息内容不能为空"}},
+        )
+    return start_session_generation(db, session, content, session_factory, box, skills_dir)
+
+
 @router.post("/sessions/{session_id}/stop")
 async def stop_generation(session_id: int, db: Session = Depends(get_db)) -> ChatStopResultOut:
     """停止当前会话的运行；等待收尾后返回结果。"""
@@ -358,7 +424,7 @@ async def stop_generation(session_id: int, db: Session = Depends(get_db)) -> Cha
 
     status = outcome.get("status")
     result = ChatStopResultOut(
-        outcome={"completed": "done", "cancelled": "cancelled"}.get(status, "error"),
+        outcome={"completed": "done", "stage_complete": "done", "cancelled": "cancelled"}.get(status, "error"),
         content=outcome.get("content", ""),
     )
     message = outcome.get("message")
@@ -370,6 +436,286 @@ async def stop_generation(session_id: int, db: Session = Depends(get_db)) -> Cha
         result.hint = error.get("hint")
         result.error_type = error.get("type")
     return result
+
+
+# ---------------------------------------------------------------------------
+# 阶段项目（阶段化开发 v2）：规划 → 逐阶段推进 → 汇总
+#
+# 每个阶段一个独立会话：项目把规划、各阶段与汇总三类会话串起来，工作区
+# 目录钉在项目上（创建会话时写入 chat_sessions.workspace_dir，Runtime 以
+# 会话上的目录优先执行），由代码保证多会话操作同一工作区。开始 / 下一
+# 阶段 / 生成汇总都会新建会话并自动发出首条消息，前端拿到返回的新会话
+# 直接切换。
+# ---------------------------------------------------------------------------
+
+
+def _project_or_404(db: Session, project_id: int) -> StageProject:
+    project = db.get(StageProject, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="阶段项目不存在或已被删除")
+    return project
+
+
+def _parse_plan(plan_json: str) -> list[dict]:
+    """解析项目计划 JSON；缺失或损坏时返回空列表。"""
+    try:
+        plan = json.loads(plan_json or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(plan, list):
+        return []
+    return [item for item in plan if isinstance(item, dict)]
+
+
+def _project_out(db: Session, project: StageProject) -> StageProjectOut:
+    """项目详情：计划清单 + 项目下各会话的映射（阶段序号 → 会话 id）。"""
+    stages = [
+        StageProjectStageOut(
+            name=str(item.get("name") or ""),
+            goal=str(item.get("goal") or ""),
+            status=str(item.get("status") or "pending"),
+        )
+        for item in _parse_plan(project.plan_json)
+    ]
+    stage_sessions: dict[int, int] = {}
+    plan_session_id: int | None = None
+    summary_session_id: int | None = None
+    rows = (
+        db.query(ChatSession)
+        .filter(ChatSession.project_id == project.id)
+        .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
+        .all()
+    )
+    for row in rows:
+        if row.project_role == PROJECT_ROLE_STAGE and row.stage_index is not None:
+            # 同一阶段可能有多次会话（重开），取最近更新的一个
+            stage_sessions.setdefault(row.stage_index, row.id)
+        elif row.project_role == PROJECT_ROLE_PLAN:
+            plan_session_id = row.id
+        elif row.project_role == PROJECT_ROLE_SUMMARY:
+            summary_session_id = row.id
+    return StageProjectOut(
+        id=project.id,
+        title=project.title,
+        agent_id=project.agent_id,
+        agent_name=project.agent_name,
+        workspace_dir=project.workspace_dir,
+        stages=stages,
+        current_stage=project.current_stage,
+        status=project.status,
+        stage_sessions=stage_sessions,
+        plan_session_id=plan_session_id,
+        summary_session_id=summary_session_id,
+        created_at=project.created_at,
+        updated_at=project.updated_at,
+    )
+
+
+def _plan_lines(project: StageProject) -> str:
+    """计划清单的文本形式（拼进自动首条消息）。"""
+    return "\n".join(
+        f"{index}. {item.get('name')} —— {item.get('goal')}"
+        for index, item in enumerate(_parse_plan(project.plan_json), start=1)
+    )
+
+
+def _create_project_session(
+    db: Session, project: StageProject, *, role: str, stage_index: int | None, title: str
+) -> ChatSession:
+    """在项目下新建会话：沿用项目的 Agent 快照与钉住的工作区。"""
+    agent: Agent | None = db.get(Agent, project.agent_id) if project.agent_id is not None else None
+    if agent is None:
+        raise HTTPException(
+            status_code=CONFLICT_STATUS,
+            detail="项目使用的 Agent 已被删除，无法继续推进；请重新规划项目",
+        )
+    now = utcnow()
+    session = ChatSession(
+        title=title[:128],
+        agent_id=agent.id,
+        created_at=now,
+        updated_at=now,
+        project_id=project.id,
+        project_role=role,
+        stage_index=stage_index,
+        workspace_dir=(project.workspace_dir or "").strip() or None,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+def _run_project_operation(
+    db: Session,
+    session: ChatSession,
+    project: StageProject,
+    content: str,
+    session_factory: sessionmaker,
+    box: SecretBox,
+    skills_dir: Path,
+) -> StageProjectOperationOut:
+    """发出自动首条消息并返回项目与新会话（生成已在后台开始）。"""
+    start_session_generation(db, session, content, session_factory, box, skills_dir)
+    db.refresh(project)
+    return StageProjectOperationOut(
+        project=_project_out(db, project),
+        session=_session_out(db, session),
+    )
+
+
+@router.get("/projects/{project_id}")
+def get_stage_project(project_id: int, db: Session = Depends(get_db)) -> StageProjectOut:
+    """阶段项目详情：计划清单、推进状态与各会话映射。"""
+    return _project_out(db, _project_or_404(db, project_id))
+
+
+@router.post("/projects/{project_id}/start", status_code=201)
+async def start_stage_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker = Depends(get_session_factory),
+    box: SecretBox = Depends(get_secret_box),
+    skills_dir: Path = Depends(get_skills_dir),
+) -> StageProjectOperationOut:
+    """确认计划并开始阶段 1：新建阶段会话（自动新建会话）并发开工消息。"""
+    project = _project_or_404(db, project_id)
+    if project.status != PROJECT_AWAITING_START:
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="该项目已开始或已结束，无法重复开始")
+    stages = _parse_plan(project.plan_json)
+    if not stages:
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="项目还没有阶段计划，无法开始")
+    first = stages[0]
+    content = (
+        f"项目「{project.title}」的开发计划已确认，请开始阶段 1：{first.get('name')}。\n"
+        f"阶段目标：{first.get('goal')}\n\n"
+        f"整体计划如下：\n{_plan_lines(project)}\n\n"
+        "请按系统提示词中的阶段化开发工作流执行：完成本阶段开发与自检后，"
+        "在工作区写交接文档并调用 finish_stage 收尾。"
+    )
+    session = _create_project_session(
+        db, project, role=PROJECT_ROLE_STAGE, stage_index=1,
+        title=f"{project.title} · 阶段 1：{first.get('name')}",
+    )
+    project.status = PROJECT_IN_PROGRESS
+    project.current_stage = 1
+    project.updated_at = utcnow()
+    db.commit()
+    return _run_project_operation(db, session, project, content, session_factory, box, skills_dir)
+
+
+@router.post("/projects/{project_id}/next", status_code=201)
+async def next_stage_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker = Depends(get_session_factory),
+    box: SecretBox = Depends(get_secret_box),
+    skills_dir: Path = Depends(get_skills_dir),
+) -> StageProjectOperationOut:
+    """进入下一阶段：新建阶段会话（自动新建会话），首条消息带上计划与
+    上一阶段的交接文档路径与下一步建议。"""
+    project = _project_or_404(db, project_id)
+    if project.status != PROJECT_IN_PROGRESS:
+        if project.status in (PROJECT_AWAITING_SUMMARY, PROJECT_SUMMARIZING, "completed"):
+            raise HTTPException(
+                status_code=CONFLICT_STATUS,
+                detail="所有阶段已完成，请点击「生成项目汇总」（页面若未刷新，重新打开该会话即可看到）",
+            )
+        raise HTTPException(
+            status_code=CONFLICT_STATUS,
+            detail="当前没有待进入的下一阶段（项目尚未开始或已结束）",
+        )
+    stages = _parse_plan(project.plan_json)
+    next_index = next(
+        (index for index, item in enumerate(stages, start=1) if item.get("status") != "done"),
+        0,
+    )
+    if next_index == 0:
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="所有阶段已完成，请生成项目汇总")
+    # 防误触：只能按顺序推进——即将进入阶段的前一阶段必须已完成
+    #（next_index=1 说明第一个阶段还没完成，不能"进入下一阶段"重开它）
+    if next_index == 1 or stages[next_index - 2].get("status") != "done":
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="当前阶段尚未完成，请先等待阶段收尾与验收")
+    prev = (
+        db.query(ChatSession)
+        .filter(
+            ChatSession.project_id == project.id,
+            ChatSession.project_role == PROJECT_ROLE_STAGE,
+            ChatSession.stage_index == next_index - 1,
+        )
+        .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
+        .first()
+    )
+    prev_summary: dict = {}
+    if prev is not None and prev.stage_summary_json:
+        try:
+            parsed = json.loads(prev.stage_summary_json)
+            if isinstance(parsed, dict):
+                prev_summary = parsed
+        except json.JSONDecodeError:
+            prev_summary = {}
+    item = stages[next_index - 1]
+    parts = [
+        f"上一阶段已完成并通过验收，请继续阶段 {next_index}：{item.get('name')}。",
+        f"阶段目标：{item.get('goal')}",
+    ]
+    if prev_summary.get("handoffPath"):
+        parts.append(f"上一阶段交接文档：{prev_summary['handoffPath']}（请先阅读该文档恢复上下文）")
+    if prev_summary.get("nextStep"):
+        parts.append(f"上一阶段下一步建议：{prev_summary['nextStep']}")
+    parts.append(f"整体计划如下：\n{_plan_lines(project)}")
+    parts.append(
+        "请按阶段化开发工作流执行：完成本阶段开发与自检后，写交接文档并调用 finish_stage 收尾。"
+    )
+    # 验收通过进入下一阶段：清掉上一阶段会话的等待验收状态
+    if prev is not None:
+        prev.awaiting_acceptance = False
+        prev.updated_at = utcnow()
+    session = _create_project_session(
+        db, project, role=PROJECT_ROLE_STAGE, stage_index=next_index,
+        title=f"{project.title} · 阶段 {next_index}：{item.get('name')}",
+    )
+    project.current_stage = next_index
+    project.updated_at = utcnow()
+    db.commit()
+    return _run_project_operation(
+        db, session, project, "\n".join(parts), session_factory, box, skills_dir
+    )
+
+
+@router.post("/projects/{project_id}/summary", status_code=201)
+async def summarize_stage_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    session_factory: sessionmaker = Depends(get_session_factory),
+    box: SecretBox = Depends(get_secret_box),
+    skills_dir: Path = Depends(get_skills_dir),
+) -> StageProjectOperationOut:
+    """生成项目汇总：新建独立汇总会话（自动新建会话），首条消息给出
+    阶段完成清单与汇总要求；汇总会话完成后项目标记 completed。"""
+    project = _project_or_404(db, project_id)
+    if project.status != PROJECT_AWAITING_SUMMARY:
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="全部阶段尚未完成，暂不能生成项目汇总")
+    stages = _parse_plan(project.plan_json)
+    done_lines = "\n".join(
+        f"{index}. {item.get('name')} —— {item.get('goal')}（已完成）"
+        for index, item in enumerate(stages, start=1)
+    )
+    content = (
+        f"项目「{project.title}」的全部 {len(stages)} 个阶段已完成，请输出整体完成情况汇报。\n\n"
+        f"阶段清单与完成情况：\n{done_lines}\n\n"
+        "各阶段的交接文档都在工作区内（handoff-*.md），请先通读这些文档再汇报，"
+        "内容包括：做了什么、验证结果、遗留事项与使用说明。不要修改代码，"
+        "不要调用 finish_stage 或 submit_stage_plan。"
+    )
+    session = _create_project_session(
+        db, project, role=PROJECT_ROLE_SUMMARY, stage_index=None,
+        title=f"{project.title} · 项目汇总",
+    )
+    project.status = PROJECT_SUMMARIZING
+    project.updated_at = utcnow()
+    db.commit()
+    return _run_project_operation(db, session, project, content, session_factory, box, skills_dir)
 
 
 @router.get("/sessions/{session_id}/approvals")

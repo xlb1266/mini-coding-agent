@@ -105,6 +105,11 @@ def seed_agent(
     compact_keep_rounds: int = 4,
     compact_summary_tokens: int = 1000,
     workspace_dir: str = "",
+    approval_level: str = "off",
+    # 测试默认高度自主：不带阶段协议提示词，便于断言纯系统提示词；
+    # 阶段确认模式由专门的测试构造
+    autonomy_mode: str = "autonomous",
+    shell_whitelist: str = "",
 ) -> int:
     seed_tools(factory)
     db = factory()
@@ -136,6 +141,9 @@ def seed_agent(
             compact_keep_rounds=compact_keep_rounds,
             compact_summary_tokens=compact_summary_tokens,
             workspace_dir=workspace_dir,
+            approval_level=approval_level,
+            autonomy_mode=autonomy_mode,
+            shell_whitelist=shell_whitelist,
             is_default=True,
             created_at=now,
             updated_at=now,

@@ -47,11 +47,14 @@ from app.db.models.evaluation import (
 from app.db.models.agent import Agent, CAPABILITY_MCP, CAPABILITY_SKILL, CAPABILITY_TOOL
 from app.db.models.model_config import ModelConfig
 from app.db.models.mcp_server import McpServer
-from app.db.models.run_record import AgentRun
+from app.db.models.run_record import AgentRun, AgentRunEvent
 from app.db.models.skill import Skill
 from app.db.models.tool import Tool
 from app.services.agent_runtime import (
+    APPROVAL_REQUEST,
     STATUS_COMPLETED,
+    STATUS_STAGE_COMPLETE,
+    TOOL_CALL_END,
     AgentRuntime,
     RunLimits,
     RunResult,
@@ -414,7 +417,7 @@ class EvaluationManager:
         if run_end_events:
             recorder.finish(run_end_events[-1])
 
-        if run_result.status != STATUS_COMPLETED:
+        if run_result.status not in (STATUS_COMPLETED, STATUS_STAGE_COMPLETE):
             # 失败 / 取消 / 轮数耗尽：保留已有输出与 Run，不作为正常答案评分
             self._save_case_fields(
                 factory,
@@ -428,8 +431,10 @@ class EvaluationManager:
             )
             return
 
-        # 正常完成：记录回答与 Run，进入评分
+        # 正常完成：记录回答与 Run，进入评分；过程摘要来自本 Run 的真实
+        # 工具事件（阶段十五过程评分的评分材料）
         run_row_id = self._lookup_run_id(factory, run_uid)
+        process_summary = self._process_digest(factory, run_uid)
         self._save_case_fields(
             factory,
             result_id,
@@ -458,6 +463,7 @@ class EvaluationManager:
                 expected_answer=expected,
                 scoring_requirements=requirements,
                 actual_answer=run_result.content,
+                process_summary=process_summary,
             )
         except ScoringRequestError as error:
             message = error.message + (f"（提示：{error.hint}）" if error.hint else "")
@@ -485,10 +491,62 @@ class EvaluationManager:
             status=CASE_STATUS_PASSED if passed else CASE_STATUS_FAILED,
             score=outcome.score,
             reason=outcome.reason,
+            process_score=outcome.process_score,
+            process_reason=outcome.process_reason,
             scoring_duration_ms=outcome.duration_ms,
             scoring_total_tokens=outcome.total_tokens,
             scoring_attempts=outcome.attempts,
         )
+
+    def _process_digest(self, factory: sessionmaker, run_uid: str) -> str:
+        """把一次 Run 的工具事件整理成过程评分材料（摘要行，脱敏已在入库前完成）。
+
+        只取工具调用结束事件与审批请求事件；没有工具事件时返回空串
+        （评分模型收不到过程材料，按提示词给 0 分）。
+        """
+        db = factory()
+        try:
+            rows = (
+                db.query(AgentRunEvent.event_type, AgentRunEvent.payload_json)
+                .filter(
+                    AgentRunEvent.run_uid == run_uid,
+                    AgentRunEvent.event_type.in_((TOOL_CALL_END, APPROVAL_REQUEST)),
+                )
+                .order_by(AgentRunEvent.seq)
+                .all()
+            )
+        finally:
+            db.close()
+
+        lines: list[str] = []
+        for event_type, payload_json in rows:
+            try:
+                payload = json.loads(payload_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if event_type == APPROVAL_REQUEST:
+                name = str(payload.get("displayName") or payload.get("toolName") or "?")
+                args = payload.get("arguments")
+                brief = ""
+                if isinstance(args, dict):
+                    first = next((v for v in args.values() if isinstance(v, str) and v.strip()), "")
+                    brief = " ".join(first.split())[:80]
+                lines.append(f"审批请求：{name}{'：' + brief if brief else ''}")
+                continue
+            name = str(payload.get("toolName") or "?")
+            status = str(payload.get("status") or "?")
+            duration = payload.get("durationMs")
+            duration_text = f"{duration}ms" if isinstance(duration, int) else ""
+            summary = " ".join(str(payload.get("summary") or "").split())[:120]
+            parts = [f"工具 {name} → {status}"]
+            if duration_text:
+                parts.append(duration_text)
+            if summary:
+                parts.append(summary)
+            lines.append("，".join(parts))
+        return "\n".join(lines[:50])
 
     def _agent_snapshot(self, factory: sessionmaker, agent_id: int) -> dict:
         """目标 Agent 与模型的名称快照（运行记录用；缺失时给占位值）。"""

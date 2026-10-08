@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.db.models.agent import (
     Agent,
     AgentBinding,
+    APPROVAL_LEVELS,
+    AUTONOMY_MODES,
     CAPABILITY_MCP,
     CAPABILITY_SKILL,
     CAPABILITY_TOOL,
@@ -120,7 +122,9 @@ def _to_out(agent: Agent) -> AgentOut:
         prompt_version=agent.prompt_version,
         max_rounds=agent.max_rounds,
         workspace_dir=agent.workspace_dir,
-        require_approval=agent.require_approval,
+        approval_level=agent.approval_level,
+        autonomy_mode=agent.autonomy_mode,
+        shell_whitelist=agent.shell_whitelist,
         auto_compact=agent.auto_compact,
         compact_threshold=agent.compact_threshold,
         compact_keep_rounds=agent.compact_keep_rounds,
@@ -239,6 +243,12 @@ def _validate_payload(
         if not Path(workspace_dir).is_absolute() or not Path(workspace_dir).is_dir():
             errors["workspaceDir"] = "工作区目录必须是已存在的绝对路径目录，或留空使用默认目录"
 
+    # 执行治理（阶段十五）：审批档位与自主档位取值校验
+    if payload.approval_level not in APPROVAL_LEVELS:
+        errors["approvalLevel"] = "审批档位只能是 off、standard 或 strict"
+    if payload.autonomy_mode not in AUTONOMY_MODES:
+        errors["autonomyMode"] = "自主档位只能是 stage_confirm 或 autonomous"
+
     existing: set[tuple[str, str]] = set()
     if agent_id is not None:
         agent = db.get(Agent, agent_id)
@@ -302,7 +312,9 @@ def create_agent(payload: AgentCreateRequest, db: Session = Depends(get_db)) -> 
         model_id=payload.model_id,
         max_rounds=payload.max_rounds,
         workspace_dir=payload.workspace_dir.strip(),
-        require_approval=payload.require_approval,
+        approval_level=payload.approval_level,
+        autonomy_mode=payload.autonomy_mode,
+        shell_whitelist=payload.shell_whitelist.strip(),
         auto_compact=payload.auto_compact,
         compact_threshold=payload.compact_threshold,
         compact_keep_rounds=payload.compact_keep_rounds,
@@ -343,7 +355,9 @@ def update_agent(
     agent.model_id = payload.model_id
     agent.max_rounds = payload.max_rounds
     agent.workspace_dir = payload.workspace_dir.strip()
-    agent.require_approval = payload.require_approval
+    agent.approval_level = payload.approval_level
+    agent.autonomy_mode = payload.autonomy_mode
+    agent.shell_whitelist = payload.shell_whitelist.strip()
     agent.auto_compact = payload.auto_compact
     agent.compact_threshold = payload.compact_threshold
     agent.compact_keep_rounds = payload.compact_keep_rounds

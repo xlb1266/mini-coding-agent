@@ -209,3 +209,157 @@ export function formatResultText(text: string): string {
   }
   return text
 }
+
+// ---------------------------------------------------------------------------
+// Shell 结果徽章与文件写入聚合（阶段十五 demo）：纯展示逻辑，便于单测
+// ---------------------------------------------------------------------------
+
+/** 解析内置工具结果里的结构化数据（后端把结果 JSON 序列化后放进 result.text）。 */
+export function parseToolResultJson(tool: ToolActivity): Record<string, unknown> | null {
+  if (!tool.result || tool.status !== 'success') return null
+  try {
+    const parsed: unknown = JSON.parse(tool.result.text)
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
+/** Shell 结果徽章的展示状态；非 Shell 工具返回 null。 */
+export interface ShellBadge {
+  /** 徽标配色：success 成功 / danger 失败（含超时）/ running 后台运行中 */
+  tone: 'success' | 'danger' | 'running'
+  icon: string
+  label: string
+  /** 后台任务的标识（长 ID 展示时由组件截断） */
+  taskId: string | null
+}
+
+/** Shell 结果徽章（纯展示，不追踪真实任务状态）：
+ *  - 超时被终止 → ✗ 超时终止；
+ *  - 后台启动 / 前台超预算自动转后台 → ● 运行中 + taskId；
+ *  - 其余按成功（✓）/ 失败（✗）展示；非 Shell 工具或没有结果时返回 null。 */
+export function shellBadge(tool: ToolActivity): ShellBadge | null {
+  if (tool.toolName !== 'builtin_shell') return null
+  if (tool.status === 'running') return null
+  const data = parseToolResultJson(tool)
+  if (tool.status === 'cancelled' || tool.status === 'unknown') {
+    return { tone: 'danger', icon: '✕', label: '已取消', taskId: null }
+  }
+  if (tool.status !== 'success') {
+    return { tone: 'danger', icon: '✕', label: '失败', taskId: null }
+  }
+  if (data === null) return null
+  const taskId = typeof data['taskId'] === 'string' && data['taskId'] ? data['taskId'] : null
+  if (data['timedOut'] === true) {
+    return { tone: 'danger', icon: '✗', label: '超时终止', taskId: null }
+  }
+  if (data['autoBackgrounded'] === true || data['action'] === 'background') {
+    return { tone: 'running', icon: '●', label: '运行中', taskId }
+  }
+  if (data['action'] === 'stop' || data['action'] === 'list') {
+    return { tone: 'success', icon: '✓', label: '完成', taskId: null }
+  }
+  if (data['success'] === false) {
+    return { tone: 'danger', icon: '✗', label: '失败', taskId: null }
+  }
+  return { tone: 'success', icon: '✓', label: '完成', taskId: null }
+}
+
+/** 是否为文件写入类调用：builtin_file 的 write 动作与 builtin_edit_file 全部操作。 */
+export function isFileWriteTool(tool: ToolActivity): boolean {
+  if (tool.status === 'running') return false
+  if (tool.toolName === 'builtin_edit_file') return true
+  return tool.toolName === 'builtin_file' && tool.arguments?.['action'] === 'write'
+}
+
+/** 一次文件写入的展示信息：路径、结果（新建/覆盖/追加/替换 N 处）与 diff 或写入内容。 */
+export interface FileWriteEntry {
+  callId: string
+  path: string
+  /** 结果短标签：新建 / 覆盖 / 追加 / 替换 N 处 */
+  outcomeLabel: string
+  /** 是否带统一 diff（edit_file），否则展示写入内容 */
+  isEdit: boolean
+  diff: string
+  content: string
+  sizeBytes: number | null
+  truncated: boolean
+}
+
+const OUTCOME_LABELS: Record<string, string> = {
+  created: '新建',
+  overwritten: '覆盖',
+  appended: '追加',
+}
+
+function entryPath(tool: ToolActivity): string {
+  const fromArgs = tool.arguments?.['path']
+  if (typeof fromArgs === 'string' && fromArgs.trim()) return fromArgs.trim()
+  return '（未知路径）'
+}
+
+/** 把一次文件写入调用转成展示信息；参数异常时返回 null。 */
+export function fileWriteEntry(tool: ToolActivity): FileWriteEntry | null {
+  if (!isFileWriteTool(tool)) return null
+  const data = parseToolResultJson(tool)
+  if (tool.toolName === 'builtin_edit_file') {
+    const replacements = data?.['replacements']
+    const diff = typeof data?.['diff'] === 'string' ? data['diff'] : ''
+    return {
+      callId: tool.callId,
+      path: entryPath(tool),
+      outcomeLabel:
+        typeof replacements === 'number' && replacements > 0 ? `替换 ${replacements} 处` : '编辑',
+      isEdit: true,
+      diff,
+      content: '',
+      sizeBytes: typeof data?.['sizeBytes'] === 'number' ? data['sizeBytes'] : null,
+      truncated: tool.result?.truncated === true,
+    }
+  }
+  const outcome = typeof data?.['outcome'] === 'string' ? data['outcome'] : ''
+  const content = typeof tool.arguments?.['content'] === 'string' ? tool.arguments['content'] : ''
+  return {
+    callId: tool.callId,
+    path: entryPath(tool),
+    outcomeLabel: OUTCOME_LABELS[outcome] ?? '写入',
+    isEdit: false,
+    diff: '',
+    content,
+    sizeBytes: typeof data?.['sizeBytes'] === 'number' ? data['sizeBytes'] : null,
+    truncated: tool.result?.truncated === true,
+  }
+}
+
+/** 组内展示分区：写入类调用全部聚合进一个 writes 节点（置于首个写入的位置），
+ *  其余调用按原顺序展示——轨迹里"修改了 N 个文件"一张卡的来源。 */
+export type GroupDisplayNode =
+  | { kind: 'writes'; tools: ToolActivity[]; entries: FileWriteEntry[] }
+  | { kind: 'tool'; tool: ToolActivity }
+
+export function partitionGroupTools(tools: ToolActivity[]): GroupDisplayNode[] {
+  const writeTools = tools.filter((tool) => isFileWriteTool(tool))
+  if (writeTools.length === 0) {
+    return tools.map((tool) => ({ kind: 'tool' as const, tool }))
+  }
+  const entries = writeTools
+    .map((tool) => fileWriteEntry(tool))
+    .filter((entry): entry is FileWriteEntry => entry !== null)
+  const writeSet = new Set(writeTools.map((tool) => tool.callId))
+  const nodes: GroupDisplayNode[] = []
+  let writesPlaced = false
+  for (const tool of tools) {
+    if (writeSet.has(tool.callId)) {
+      if (!writesPlaced) {
+        writesPlaced = true
+        nodes.push({ kind: 'writes', tools: writeTools, entries })
+      }
+      continue
+    }
+    nodes.push({ kind: 'tool', tool })
+  }
+  return nodes
+}

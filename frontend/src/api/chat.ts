@@ -22,14 +22,66 @@ export interface ChatMessage {
   timeline?: GenerationTimelineItem[] | null
 }
 
+/** 阶段化开发（阶段十五）：finish_stage 上报的阶段摘要（脱敏后）。 */
+export interface StageSummary {
+  stageName: string
+  summary: string
+  handoffPath: string
+  nextStep: string
+}
+
 export interface ChatSessionSummary {
   id: number
   title: string
   agentId: number | null
   agentName: string | null
   isGenerating: boolean
+  /** True 表示上一阶段已完成（finish_stage），等待用户验收 */
+  awaitingAcceptance?: boolean
+  /** 上一阶段的交接摘要；无则为 null/缺省 */
+  stageSummary?: StageSummary | null
+  /** 所属阶段项目 id（阶段化开发 v2）；普通会话为 null/缺省 */
+  projectId?: number | null
+  /** 项目里的角色：plan（规划）/ stage（阶段）/ summary（汇总） */
+  projectRole?: 'plan' | 'stage' | 'summary' | null
+  /** 本会话负责的项目阶段序号（1-based）；规划与汇总会话为 null */
+  stageIndex?: number | null
   createdAt: string
   updatedAt: string
+}
+
+/** 阶段项目（阶段化开发 v2）：阶段清单与推进状态。 */
+export interface StageProjectStage {
+  name: string
+  goal: string
+  status: 'pending' | 'in_progress' | 'done'
+}
+
+/** 项目状态机：待开始 → 推进中 → 待汇总 → 汇总中 → 已完成 */
+export type StageProjectStatus = 'awaiting_start' | 'in_progress' | 'awaiting_summary' | 'summarizing' | 'completed'
+
+export interface StageProject {
+  id: number
+  title: string
+  agentId: number | null
+  agentName: string
+  /** 项目钉住的工作区目录（各阶段会话一致） */
+  workspaceDir: string
+  stages: StageProjectStage[]
+  currentStage: number
+  status: StageProjectStatus
+  /** 阶段序号（1-based）→ 该阶段会话 id */
+  stageSessions: Record<number, number>
+  planSessionId: number | null
+  summarySessionId: number | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** 项目推进操作（开始 / 下一阶段 / 生成汇总）的结果：新会话已创建并自动发出首条消息。 */
+export interface StageProjectOperationResult {
+  project: StageProject
+  session: ChatSessionSummary
 }
 
 /** 进行中的生成状态：thinking 尚无正文，generating 正文输出中，tooling 工具执行中，compacting 压缩上下文中，approval 等待审批。 */
@@ -165,7 +217,21 @@ export interface RunError {
   hint: string | null
 }
 
-export type RunStatus = 'completed' | 'cancelled' | 'error' | 'rounds_exhausted'
+/** 运行结束状态；stage_complete 为阶段确认模式下的正常收尾（等待验收），
+ *  plan_submitted 为规划会话提交阶段计划后的正常收尾（等待确认开始）。 */
+export type RunStatus =
+  | 'completed'
+  | 'stage_complete'
+  | 'plan_submitted'
+  | 'cancelled'
+  | 'error'
+  | 'rounds_exhausted'
+
+/** 阶段计划（run_end.plan）：submit_stage_plan 的上报内容。 */
+export interface StagePlanPayload {
+  title: string
+  stages: { name: string; goal: string }[]
+}
 
 /** SSE 事件流的事件载荷，与后端 Agent Runtime 的统一运行事件协议一致。 */
 export type ChatEvent =
@@ -280,6 +346,10 @@ export type ChatEvent =
       roundsUsed: number
       content: string
       message: ChatMessage | null
+      /** 阶段收尾信息（stage_complete 时携带 finish_stage 的摘要） */
+      stage?: StageSummary | null
+      /** 阶段计划（plan_submitted 时携带 submit_stage_plan 的上报内容） */
+      plan?: StagePlanPayload | null
       error: RunError | null
     }
   | {
@@ -378,6 +448,31 @@ export function decideChatApproval(
   action: 'approve' | 'reject',
 ): Promise<{ requestId: string; action: string; outcome: string }> {
   return post(`/api/chat/sessions/${sessionId}/approvals/${requestId}/decision`, { action })
+}
+
+/** 验收通过（阶段化开发）：清除会话的阶段等待状态，之后可继续下一阶段。 */
+export function acceptChatStage(sessionId: number): Promise<ChatSessionSummary> {
+  return post<ChatSessionSummary>(`/api/chat/sessions/${sessionId}/stage/accept`, {})
+}
+
+/** 阶段项目详情：计划清单、推进状态与各会话映射。 */
+export function getStageProject(projectId: number): Promise<StageProject> {
+  return get<StageProject>(`/api/chat/projects/${projectId}`)
+}
+
+/** 确认计划并开始阶段 1：后端自动新建阶段会话并发出开工消息。 */
+export function startStageProject(projectId: number): Promise<StageProjectOperationResult> {
+  return post<StageProjectOperationResult>(`/api/chat/projects/${projectId}/start`, {})
+}
+
+/** 进入下一阶段：后端自动新建阶段会话，首条消息带上计划与上一阶段交接。 */
+export function nextStageProject(projectId: number): Promise<StageProjectOperationResult> {
+  return post<StageProjectOperationResult>(`/api/chat/projects/${projectId}/next`, {})
+}
+
+/** 生成项目汇总：后端新建独立汇总会话并发汇总要求。 */
+export function summarizeStageProject(projectId: number): Promise<StageProjectOperationResult> {
+  return post<StageProjectOperationResult>(`/api/chat/projects/${projectId}/summary`, {})
 }
 
 /**

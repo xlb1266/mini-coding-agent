@@ -68,13 +68,25 @@ class ChatMessageOut(CamelModel):
 
 
 class ChatSessionOut(CamelModel):
-    """会话摘要；agentName 在 Agent 被删除后为 null。"""
+    """会话摘要；agentName 在 Agent 被删除后为 null。
+
+    awaitingAcceptance / stageSummary 为阶段化开发状态（阶段十五）：
+    上一阶段已完成（finish_stage）等待验收时为 True，stageSummary 是
+    finish_stage 的阶段摘要（stageName / summary / handoffPath / nextStep）。
+    projectId / projectRole / stageIndex 为阶段化开发 v2 的项目归属：
+    项目下的会话标明角色（plan / stage / summary）与负责的阶段序号。
+    """
 
     id: int
     title: str
     agent_id: int | None = None
     agent_name: str | None = None
     is_generating: bool
+    awaiting_acceptance: bool = False
+    stage_summary: dict[str, Any] | None = None
+    project_id: int | None = None
+    project_role: str | None = None
+    stage_index: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -83,6 +95,50 @@ class ChatSessionOut(CamelModel):
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.isoformat()
+
+
+class StageProjectStageOut(CamelModel):
+    """阶段计划里的一项：名称、目标与状态（pending / in_progress / done）。"""
+
+    name: str
+    goal: str
+    status: str
+
+
+class StageProjectOut(CamelModel):
+    """阶段项目：计划清单、推进状态与项目下各会话的映射。
+
+    stageSessions 为阶段序号（1-based）→ 该阶段会话 id 的映射（跳转用）；
+    planSessionId / summarySessionId 为规划与汇总会话。
+    """
+
+    id: int
+    title: str
+    agent_id: int | None = None
+    agent_name: str
+    workspace_dir: str
+    stages: list[StageProjectStageOut] = []
+    current_stage: int = 0
+    status: str
+    stage_sessions: dict[int, int] = {}
+    plan_session_id: int | None = None
+    summary_session_id: int | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+
+
+class StageProjectOperationOut(CamelModel):
+    """项目推进操作（开始 / 下一阶段 / 生成汇总）的结果：
+    后端已创建新会话并自动发出首条消息，前端切换到该会话即可。"""
+
+    project: StageProjectOut
+    session: ChatSessionOut
 
 
 class ChatGenerationOut(CamelModel):

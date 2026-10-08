@@ -3,13 +3,50 @@ import { describe, expect, it } from 'vitest'
 import {
   argumentEntries,
   buildDisplayItems,
+  fileWriteEntry,
   formatArgumentValue,
   formatResultText,
+  isFileWriteTool,
+  partitionGroupTools,
   primaryArgument,
+  shellBadge,
   toolAction,
   toolRowText,
 } from '../chat-format'
 import type { GenerationSegment, ToolActivity } from '../../stores/chat'
+
+function shellTool(overrides: Partial<ToolActivity>, resultData: Record<string, unknown> | null): ToolActivity {
+  return {
+    callId: 'c1',
+    toolName: 'builtin_shell',
+    displayName: 'Shell',
+    serverName: null,
+    toolType: 'builtin',
+    status: 'success',
+    ...overrides,
+    result:
+      resultData === null
+        ? null
+        : { text: JSON.stringify(resultData), truncated: false, totalLength: 0 },
+  } as ToolActivity
+}
+
+function writeTool(overrides: Partial<ToolActivity>, resultData: Record<string, unknown> | null): ToolActivity {
+  return {
+    callId: 'w1',
+    toolName: 'builtin_file',
+    displayName: '文件读写',
+    serverName: null,
+    toolType: 'builtin',
+    status: 'success',
+    ...overrides,
+    arguments: { action: 'write', path: 'src/app.py', content: 'print("hi")\nprint("bye")', ...(overrides.arguments ?? {}) },
+    result:
+      resultData === null
+        ? null
+        : { text: JSON.stringify(resultData), truncated: false, totalLength: 0 },
+  } as ToolActivity
+}
 
 describe('chat-format 参数格式化', () => {
   it('字符串保留原文与换行，其余 JSON 化带缩进', () => {
@@ -180,5 +217,85 @@ describe('chat-format 时间线分组', () => {
     const keys = items.map((item) => item.key)
 
     expect(new Set(keys).size).toBe(keys.length)
+  })
+})
+
+
+describe('chat-format Shell 结果徽章（阶段十五 demo）', () => {
+  it('超时被终止显示“超时终止”', () => {
+    const badge = shellBadge(shellTool({}, { command: 'sleep 100', timedOut: true, exitCode: null, success: false }))
+    expect(badge).toEqual({ tone: 'danger', icon: '✗', label: '超时终止', taskId: null })
+  })
+
+  it('后台启动与自动转后台显示“运行中”并带 taskId', () => {
+    const background = shellBadge(shellTool({}, { action: 'background', taskId: 'task-abc', command: 'npm run dev' }))
+    expect(background).toMatchObject({ tone: 'running', icon: '●', label: '运行中', taskId: 'task-abc' })
+    const auto = shellBadge(shellTool({}, { action: 'run', autoBackgrounded: true, taskId: 'task-def' }))
+    expect(auto).toMatchObject({ tone: 'running', taskId: 'task-def' })
+  })
+
+  it('普通成败分别给 ✓ 与 ✗；list/stop 按 ✓ 完成', () => {
+    expect(shellBadge(shellTool({}, { command: 'ls', exitCode: 0, success: true })))
+      .toMatchObject({ tone: 'success', icon: '✓' })
+    expect(shellBadge(shellTool({}, { command: 'ls', exitCode: 1, success: false })))
+      .toMatchObject({ tone: 'danger', icon: '✗' })
+    expect(shellBadge(shellTool({}, { action: 'list', jobs: [], totalJobs: 0 })))
+      .toMatchObject({ tone: 'success', icon: '✓' })
+  })
+
+  it('非 Shell 工具、执行中或没有结果时返回 null', () => {
+    expect(shellBadge({ ...shellTool({}, { success: true }), toolName: 'builtin_file' })).toBeNull()
+    expect(shellBadge(shellTool({ status: 'running' }, null))).toBeNull()
+    expect(shellBadge(shellTool({}, null))).toBeNull()
+  })
+})
+
+describe('chat-format 文件写入聚合（阶段十五 demo）', () => {
+  it('isFileWriteTool 识别 write 与 edit_file，读取不算', () => {
+    expect(isFileWriteTool(writeTool({}, { outcome: 'created' }))).toBe(true)
+    expect(isFileWriteTool({ ...writeTool({}, null), toolName: 'builtin_edit_file', arguments: { path: 'a.py' } })).toBe(true)
+    expect(isFileWriteTool({ ...writeTool({}, null), arguments: { action: 'read', path: 'a.py' } })).toBe(false)
+    expect(isFileWriteTool({ ...writeTool({}, null), status: 'running' })).toBe(false)
+  })
+
+  it('fileWriteEntry 提取编辑 diff 与替换次数', () => {
+    const entry = fileWriteEntry({
+      ...writeTool({}, null),
+      toolName: 'builtin_edit_file',
+      arguments: { path: 'src/app.py' },
+      result: {
+        text: JSON.stringify({
+          path: 'src/app.py',
+          replacements: 2,
+          diff: '--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new',
+        }),
+        truncated: false,
+        totalLength: 0,
+      },
+    })
+    expect(entry).not.toBeNull()
+    expect(entry!.outcomeLabel).toBe('替换 2 处')
+    expect(entry!.isEdit).toBe(true)
+    expect(entry!.diff).toContain('+new')
+  })
+
+  it('fileWriteEntry 提取写入内容与结果标签', () => {
+    const entry = fileWriteEntry(writeTool({}, { outcome: 'created', sizeBytes: 20 }))
+    expect(entry).not.toBeNull()
+    expect(entry!.outcomeLabel).toBe('新建')
+    expect(entry!.isEdit).toBe(false)
+    expect(entry!.content).toContain('print("hi")')
+    expect(entry!.sizeBytes).toBe(20)
+  })
+
+  it('partitionGroupTools 把写入类聚合为一张卡，其余保持顺序', () => {
+    const read = { ...writeTool({}, null), callId: 'r1', arguments: { action: 'read', path: 'b.py' } }
+    const edit = { ...writeTool({}, null), callId: 'e1', toolName: 'builtin_edit_file', arguments: { path: 'c.py' } }
+    const shell = shellTool({ callId: 's1' }, { success: true })
+    const nodes = partitionGroupTools([read, writeTool({ callId: 'w1' }, { outcome: 'created' }), shell, edit, writeTool({ callId: 'w2' }, { outcome: 'overwritten' })])
+    expect(nodes.map((node) => node.kind)).toEqual(['tool', 'writes', 'tool'])
+    const writes = nodes[1]!
+    if (writes.kind !== 'writes') throw new Error('expected writes node')
+    expect(writes.entries.map((entry) => entry.callId)).toEqual(['w1', 'e1', 'w2'])
   })
 })

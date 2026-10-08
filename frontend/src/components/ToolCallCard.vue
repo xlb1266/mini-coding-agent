@@ -12,6 +12,7 @@ import type { ToolActivity, ToolActivityStatus } from '../stores/chat'
 import {
   formatResultText,
   RESULT_PREVIEW_LIMIT,
+  shellBadge,
   toolAction,
   toolRowText,
 } from '../views/chat-format'
@@ -32,6 +33,16 @@ const STATUS_META: Record<ToolActivityStatus, { label: string; icon: string }> =
 }
 
 const statusMeta = computed(() => STATUS_META[props.tool.status] ?? STATUS_META.unknown!)
+
+/** Shell 结果徽章（阶段十五 demo，纯展示）：✓/✗、超时终止、后台运行中+taskId。 */
+const shell = computed(() => shellBadge(props.tool))
+
+/** taskId 展示截断：过长时省略中段，完整值放 title。 */
+const taskIdShort = computed(() => {
+  const id = shell.value?.taskId
+  if (!id) return ''
+  return id.length <= 12 ? id : `${id.slice(0, 10)}…`
+})
 
 const typeLabel = computed(() => {
   if (props.tool.toolType === 'mcp') return 'MCP'
@@ -90,7 +101,17 @@ function toggle(): void {
       </span>
       <span class="tool-prefix">{{ action.prefix }}</span>
       <span v-if="rowText" class="tool-pill" :title="rowText">{{ rowText }}</span>
-      <span class="tool-status" :title="statusMeta.label">
+      <!-- Shell 结果徽章：超时 / 后台任务 / 成败（纯展示） -->
+      <span v-if="shell" class="tool-shell" :class="`is-${shell.tone}`">
+        <span class="tool-shell-icon" aria-hidden="true">{{ shell.icon }}</span>
+        <span class="tool-shell-label">{{ shell.label }}</span>
+        <span
+          v-if="taskIdShort"
+          class="tool-shell-task"
+          :title="`taskId：${shell.taskId}（展示用，状态以后台任务列表为准）`"
+        >{{ taskIdShort }}</span>
+      </span>
+      <span v-else class="tool-status" :title="statusMeta.label">
         <span class="tool-status-icon" :aria-label="statusMeta.label">{{ statusMeta.icon }}</span>
         <span v-if="durationText" class="tool-duration">{{ durationText }}</span>
       </span>
@@ -232,6 +253,60 @@ function toggle(): void {
 .tool-card.is-cancelled .tool-duration,
 .tool-card.is-unknown .tool-duration {
   color: var(--danger);
+}
+
+/* ---- Shell 结果徽章（阶段十五 demo） ---- */
+
+.tool-shell {
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 3px;
+  align-items: center;
+  margin-left: auto;
+  font-size: 10.5px;
+}
+
+.tool-shell-icon {
+  font-size: 11px;
+}
+
+.tool-shell-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.tool-shell.is-success .tool-shell-icon {
+  color: var(--success);
+}
+
+.tool-shell.is-danger .tool-shell-icon {
+  color: var(--danger);
+}
+
+.tool-shell.is-danger .tool-shell-label {
+  color: var(--danger);
+}
+
+.tool-shell.is-running .tool-shell-icon {
+  color: var(--accent);
+  animation: tool-pulse 1.2s ease-in-out infinite;
+}
+
+.tool-shell.is-running .tool-shell-label {
+  color: var(--accent);
+}
+
+.tool-shell-task {
+  max-width: 90px;
+  overflow: hidden;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-active);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @keyframes tool-pulse {

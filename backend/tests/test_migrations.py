@@ -68,8 +68,14 @@ def test_migration_upgrade_downgrade_roundtrip(tmp_path: Path) -> None:
         column_names(db_path, "agents")
     )
     assert {"summary_text", "summary_boundary_seq"} <= set(column_names(db_path, "chat_sessions"))
-    # 模块一：Agent 工作区目录与审批开关；三个内置编码工具种子
-    assert {"workspace_dir", "require_approval"} <= set(column_names(db_path, "agents"))
+    # 模块一：Agent 工作区目录；三个内置编码工具种子
+    assert {"workspace_dir"} <= set(column_names(db_path, "agents"))
+    # 阶段十五：审批档位取代布尔开关（旧列删除），新增自主档位与命令白名单；
+    # 会话阶段验收状态与评测过程评分列
+    assert {"approval_level", "autonomy_mode", "shell_whitelist"} <= set(column_names(db_path, "agents"))
+    assert "require_approval" not in set(column_names(db_path, "agents"))
+    assert {"awaiting_acceptance", "stage_summary_json"} <= set(column_names(db_path, "chat_sessions"))
+    assert {"process_score", "process_reason"} <= set(column_names(db_path, "eval_task_results"))
     assert set(seed_tool_keys(db_path)) >= {
         "builtin_current_time",
         "builtin_shell",

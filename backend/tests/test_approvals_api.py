@@ -70,7 +70,7 @@ def api_env(db_engine: object, tmp_path):
             prompt_version=1,
             model_id=model.id,
             max_rounds=5,
-            require_approval=True,
+            approval_level="standard",
             is_default=False,
             created_at=now,
             updated_at=now,

@@ -12,4 +12,5 @@ from app.db.models.mcp_server import McpEnvVar, McpServer  # noqa: F401
 from app.db.models.model_config import ModelConfig, ModelSecret  # noqa: F401
 from app.db.models.run_record import AgentRun, AgentRunEvent, AgentRunEventDetail  # noqa: F401
 from app.db.models.skill import Skill  # noqa: F401
+from app.db.models.stage_project import StageProject  # noqa: F401
 from app.db.models.tool import Tool  # noqa: F401

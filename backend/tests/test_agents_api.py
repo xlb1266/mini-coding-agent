@@ -460,7 +460,9 @@ class TestWorkspaceDir:
         body = create_agent(client, model["id"])
 
         assert body["workspaceDir"] == ""
-        assert body["requireApproval"] is False
+        assert body["approvalLevel"] == "off"
+        assert body["autonomyMode"] == "stage_confirm"
+        assert body["shellWhitelist"] == ""
 
     def test_valid_absolute_dir_saved(self, client: TestClient, seeded_tools: None, tmp_path: Path) -> None:
         ws = tmp_path / "agent-ws"

@@ -330,13 +330,46 @@ class TestNotifications:
 # ---------------------------------------------------------------------------
 
 
+def make_standard_state():
+    """standard 审批档位的最小运行状态（审批规则测试用）。"""
+    from app.services.agent_runtime import _RunState, _LoadedConfig
+    from app.services.context_compaction import CompactionSettings, compute_capacity
+
+    compaction = CompactionSettings(
+        enabled=True, threshold_percent=80, keep_rounds=4, summary_target_tokens=1000
+    )
+    state = _RunState(run_id="t", on_event=None)
+    state.config = _LoadedConfig(
+        agent_id=1,
+        agent_name="x",
+        system_prompt="",
+        model_base_url="",
+        model_identifier="m",
+        context_length=32768,
+        max_output_tokens=512,
+        temperature=0.0,
+        api_key=None,
+        max_rounds=5,
+        tool_rows={},
+        skills=[],
+        mcp_servers=[],
+        compaction=compaction,
+        capacity=compute_capacity(compaction, 32768, 512),
+        approval_level="standard",
+        shell_whitelist=[],
+    )
+    return state
+
+
 def shell_entry(ref_key: str) -> _ToolEntry:
     return _ToolEntry(name=ref_key, tool_type="builtin", display_name=ref_key, descriptor={}, ref_key=ref_key)
 
 
 class TestApprovalRules:
     def test_shell_approval_by_action(self, runtime) -> None:
-        requires = runtime.tool_requires_approval
+        """standard 档位：Shell 按动作区分，缺省视为 run。"""
+        state = make_standard_state()
+        requires = lambda entry, args: runtime.tool_requires_approval(state, entry, args)
         assert requires(shell_entry("builtin_shell"), {"action": "run"}) is True
         assert requires(shell_entry("builtin_shell"), {}) is True  # 缺省视为 run
         assert requires(shell_entry("builtin_shell"), {"action": "background"}) is True
@@ -344,7 +377,8 @@ class TestApprovalRules:
         assert requires(shell_entry("builtin_shell"), {"action": "list"}) is False
 
     def test_other_tools_unchanged(self, runtime) -> None:
-        requires = runtime.tool_requires_approval
+        state = make_standard_state()
+        requires = lambda entry, args: runtime.tool_requires_approval(state, entry, args)
         assert requires(shell_entry("builtin_file"), {"action": "write"}) is True
         assert requires(shell_entry("builtin_file"), {"action": "read"}) is False
         assert requires(shell_entry("builtin_edit_file"), {}) is True

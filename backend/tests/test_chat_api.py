@@ -60,6 +60,8 @@ def create_agent(client: TestClient, model_id: int, **overrides: object) -> dict
         "toolKeys": [],
         "skillDirNames": [],
         "mcpServerIds": [],
+        # 测试默认高度自主：不带阶段协议提示词，便于断言纯系统提示词
+        "autonomyMode": "autonomous",
     }
     payload.update(overrides)
     response = client.post("/api/agents", json=payload)

@@ -32,6 +32,21 @@ CAPABILITY_SKILL = "skill"
 CAPABILITY_MCP = "mcp"
 CAPABILITY_TYPES = (CAPABILITY_TOOL, CAPABILITY_SKILL, CAPABILITY_MCP)
 
+# ---- 审批档位（阶段十五，取代原布尔审批开关）----
+# off=不审批；standard=高风险动作审批（Shell 执行/后台/停止、文件写入、编辑）；
+# strict=全部内置工具都审批（时间查询除外）。MCP 工具本版不做审批。
+APPROVAL_OFF = "off"
+APPROVAL_STANDARD = "standard"
+APPROVAL_STRICT = "strict"
+APPROVAL_LEVELS = (APPROVAL_OFF, APPROVAL_STANDARD, APPROVAL_STRICT)
+
+# ---- 自主档位（阶段十五）----
+# stage_confirm=阶段确认（提供 finish_stage 工具，阶段完成即停等人验收）；
+# autonomous=高度自主（不提供 finish_stage，模型自行决定何时收尾）。
+AUTONOMY_STAGE_CONFIRM = "stage_confirm"
+AUTONOMY_AUTONOMOUS = "autonomous"
+AUTONOMY_MODES = (AUTONOMY_STAGE_CONFIRM, AUTONOMY_AUTONOMOUS)
+
 
 class Agent(Base):
     """一个面向具体任务的 Agent 配置。"""
@@ -49,12 +64,17 @@ class Agent(Base):
     )
     # Agent Loop 的最大执行轮数
     max_rounds: Mapped[int] = mapped_column(Integer, nullable=False)
-    # ---- 工作区与审批（模块一）----
+    # ---- 工作区与执行治理（模块一 + 阶段十五）----
     # 工作区目录：空串 = 使用全局默认目录（settings.tool_workspace_dir）；
     # 填写时必须是已存在的绝对路径目录（保存时校验，不自动创建）。
     workspace_dir: Mapped[str] = mapped_column(String(512), nullable=False, default="")
-    # 工具调用是否需要人工审批；本列模块一仅落库，审批逻辑在模块二实现
-    require_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 审批档位（取代原布尔审批开关 require_approval，0015 已删除该列）
+    approval_level: Mapped[str] = mapped_column(String(16), nullable=False, default=APPROVAL_OFF)
+    # 自主档位：决定是否提供 finish_stage 工具与阶段协议提示词
+    autonomy_mode: Mapped[str] = mapped_column(String(16), nullable=False, default=AUTONOMY_STAGE_CONFIRM)
+    # Shell 命令白名单：换行或逗号分隔的命令前缀；命中的 Shell 调用免审批
+    # （危险命令黑名单仍然生效，白名单只跳过人工审批这一层）
+    shell_whitelist: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # ---- 上下文压缩配置（默认开启；关闭后不生成摘要，超容量直接提示） ----
     auto_compact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # 触发比例：估算输入达到可用输入容量的百分之多少时触发（10–95）
