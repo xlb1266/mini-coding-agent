@@ -32,3 +32,4 @@ backend/secret.key
 
 # 本地开发笔记，不参与版本控制
 docs/
+/底座与coding-agent合并注意事项.md
