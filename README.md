@@ -40,7 +40,7 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
 
 命令含义：`uv run` 在项目虚拟环境中执行命令；`uvicorn app.main:app` 指启动 `app/main.py` 里的 FastAPI 实例；`--host 127.0.0.1` 限制只监听本机；`--reload` 让代码修改后自动重启。
 
-验证：访问 http://127.0.0.1:8000/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
+验证：访问 http://127.0.0.1:8001/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
 
 ### 2. 启动前端（端口 5174）
 
@@ -50,7 +50,7 @@ npm install                                      # 安装依赖
 npm run dev -- --port 5174                                 # 启动 Vite 开发服务
 ```
 
-打开 http://localhost:5174 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8000 端口的后端，业务代码不写死后端地址。
+打开 http://localhost:5174 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8001 端口的后端，业务代码不写死后端地址。
 
 ## 测试
 

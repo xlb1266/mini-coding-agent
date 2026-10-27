@@ -43,7 +43,7 @@ mini-coding-agent 是一个本地优先的 coding agent 工作台，由 mini-age
 | 命令 | 作用 |
 | --- | --- |
 | `uv sync` | 安装依赖（按 uv.lock） |
-| `uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload` | 启动开发服务，只监听本机 |
+| `uv run uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload` | 启动开发服务，只监听本机 |
 | `uv run pytest` | 运行测试 |
 | `uv run alembic upgrade head` | 应用迁移 |
 | `uv run alembic revision -m "说明"` | 新建迁移脚本（需手写 upgrade/downgrade） |
@@ -53,7 +53,7 @@ mini-coding-agent 是一个本地优先的 coding agent 工作台，由 mini-age
 | 命令 | 作用 |
 | --- | --- |
 | `npm install` | 安装依赖 |
-| `npm run dev` | 启动开发服务（5173，/api 代理到 8000） |
+| `npm run dev` | 启动开发服务（5174，/api 代理到 8001） |
 | `npm run type-check` | vue-tsc 类型检查 |
 | `npm run test` | Vitest 测试 |
 | `npm run build` | 类型检查 + 生产构建 |
@@ -71,7 +71,7 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
 
 命令含义：`uv run` 在项目虚拟环境中执行命令；`uvicorn app.main:app` 指启动 `app/main.py` 里的 FastAPI 实例；`--host 127.0.0.1` 限制只监听本机；`--reload` 让代码修改后自动重启。
 
-验证：访问 http://127.0.0.1:8000/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
+验证：访问 http://127.0.0.1:8001/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
 
 ### 2. 启动前端（端口 5174）
 
@@ -81,14 +81,14 @@ npm install                                      # 安装依赖
 npm run dev -- --port 5174                                 # 启动 Vite 开发服务
 ```
 
-打开 http://localhost:5174 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8000 端口的后端，业务代码不写死后端地址。
+打开 http://localhost:5174 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8001 端口的后端，业务代码不写死后端地址。
 
 
 ## 硬性规则
 
 - Python 一律走 uv：装依赖用 `uv add`，同步用 `uv sync`，运行命令用 `uv run`（含 Alembic、pytest）。禁止 pip，README 与文档中不得出现让用户直接运行 pip 的步骤。
 - 后端默认只监听 `127.0.0.1`。
-- 前端所有请求使用相对路径 `/api/**`，由 Vite dev server 代理到 `http://127.0.0.1:8000`；业务代码不得写死后端地址。
+- 前端所有请求使用相对路径 `/api/**`，由 Vite dev server 代理到 `http://127.0.0.1:8001`；业务代码不得写死后端地址。
 - 数据库只用 SQLite（`backend/mini_agent.db`）。业务数据一律入库；改表必须新增 Alembic migration，不手改库，不用 JSON 文件存业务数据。
 - 不引入新的大型依赖，保持现有技术栈。
 
