@@ -404,6 +404,8 @@ class GenerationRun:
     summary_boundary: int | None = None
     # 工具执行审批（模块二）：审批档位不为 off 时提供钩子，评测路径始终不审批
     approval_level: str = "off"
+    # 会话级自主档位覆盖（聊天输入框切换）；空串表示跟随 Agent 配置
+    autonomy_mode: str = ""
     # 运行级工作区覆盖（阶段化开发 v2）：项目下的会话把项目钉住的目录
     # 写上会话；空串表示跟随 Agent 配置的工作区
     workspace_dir: str = ""
@@ -466,6 +468,7 @@ class GenerationManager:
         model_name: str = "",
         model_identifier: str = "",
         approval_level: str = "off",
+        autonomy_mode: str = "",
         workspace_dir: str = "",
     ) -> None:
         """启动一次后台运行；同一会话同时只允许一个运行。
@@ -491,6 +494,7 @@ class GenerationManager:
             session_summary=session_summary,
             summary_boundary=summary_boundary,
             approval_level=approval_level,
+            autonomy_mode=autonomy_mode,
             workspace_dir=workspace_dir,
             started_at_ms=int(time.time() * 1000),
         )
@@ -988,6 +992,9 @@ class GenerationManager:
                 ),
                 approval=approval_hooks,
                 workspace_dir=run.workspace_dir,
+                model_id=run.model_id,
+                approval_level=run.approval_level,
+                autonomy_mode=run.autonomy_mode,
             )
             await runtime.run(
                 request,

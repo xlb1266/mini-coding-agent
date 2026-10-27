@@ -1354,3 +1354,180 @@ class TestMessagePayload:
         assert "timeline" not in payload
         assert payload["content"] == "先查时间：现在是北京时间"
         assert payload["sessionId"] == 1
+
+
+# ---- 会话级档位与模型覆盖（聊天输入框切换） ----
+
+
+class TestSessionModeAndModel:
+    def test_switch_mode_persists_on_session(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.put(
+            f"/api/chat/sessions/{session['id']}/mode",
+            json={"approvalLevel": "standard", "autonomyMode": "stage_confirm"},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["approvalLevel"] == "standard"
+        assert body["autonomyMode"] == "stage_confirm"
+        # 其他会话不受影响（会话级覆盖）
+        other = create_session(client, agent_id=agent["id"])
+        assert other["approvalLevel"] is None
+        assert other["autonomyMode"] is None
+
+    def test_switch_mode_rejects_invalid_values(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.put(
+            f"/api/chat/sessions/{session['id']}/mode",
+            json={"approvalLevel": "yolo", "autonomyMode": "stage_confirm"},
+        )
+
+        assert response.status_code == 422
+
+    def test_switch_model_persists_on_session(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        other_model = create_model(client, displayName="备用模型", modelIdentifier="backup-1")
+        session = create_session(client, agent_id=agent["id"])
+        assert session["modelId"] is None
+
+        response = client.put(
+            f"/api/chat/sessions/{session['id']}/model", json={"modelId": other_model["id"]}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["modelId"] == other_model["id"]
+
+    def test_switch_model_rejects_unknown_model(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.put(f"/api/chat/sessions/{session['id']}/model", json={"modelId": 9999})
+
+        assert response.status_code == 422
+
+    def test_mode_and_model_blocked_while_generating(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+        # 直接占住生成状态：路由只检查 is_generating，无需真实运行
+        from app.services.chat_generation import GenerationRun, generation_manager
+
+        generation_manager._runs[session["id"]] = GenerationRun(
+            session_id=session["id"],
+            agent_id=agent["id"],
+            agent_name="x",
+            user_input="x",
+            history=[],
+            api_key=None,
+            session_factory=None,
+            secret_box=None,
+            skills_dir=None,
+        )
+        try:
+            mode = client.put(
+                f"/api/chat/sessions/{session['id']}/mode",
+                json={"approvalLevel": "off", "autonomyMode": "autonomous"},
+            )
+            model = client.put(
+                f"/api/chat/sessions/{session['id']}/model", json={"modelId": 1}
+            )
+        finally:
+            generation_manager._runs.clear()
+
+        assert mode.status_code == 409
+        assert model.status_code == 409
+
+    def test_session_overrides_reach_model_request(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """会话级覆盖端到端生效：换模型 + 开阶段确认后，请求打到新模型、
+        系统提示词带阶段协议（Agent 本身是高度自主 + 首个模型）。"""
+        agent = seed_default_agent(client, autonomyMode="autonomous")
+        second_model = create_model(
+            client,
+            displayName="第二模型",
+            modelIdentifier="second-1",
+            baseUrl="https://second.example.com/v1",
+        )
+        session = create_session(client, agent_id=agent["id"])
+        assert (
+            client.put(
+                f"/api/chat/sessions/{session['id']}/mode",
+                json={"approvalLevel": "off", "autonomyMode": "stage_confirm"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.put(
+                f"/api/chat/sessions/{session['id']}/model", json={"modelId": second_model["id"]}
+            ).status_code
+            == 200
+        )
+        capture: list[dict] = []
+        install_stream(
+            monkeypatch,
+            StreamTransport(chunks=[delta_chunk("好的"), DONE_CHUNK], capture=capture),
+        )
+
+        assert send_message(client, session["id"], "你好").status_code == 201
+        wait_generation_done(client, session["id"])
+
+        assert len(capture) == 1
+        assert capture[0]["url"] == "https://second.example.com/v1/chat/completions"
+        system = capture[0]["body"]["messages"][0]
+        assert system["role"] == "system"
+        assert "阶段化开发工作流" in system["content"]
+        assert "## 可用 Skills" not in system["content"]
+
+
+# ---- 上下文占用量（估算口径） ----
+
+
+class TestContextUsage:
+    def test_usage_shape_and_categories(self, client: TestClient) -> None:
+        agent = seed_default_agent(client, autonomyMode="stage_confirm")
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.get(f"/api/chat/sessions/{session['id']}/context-usage")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["contextLength"] == 32768
+        assert body["estimatedTokens"] > 0
+        assert body["availableInputTokens"] > 0
+        assert body["availableInputTokens"] < body["contextLength"]
+        keys = [c["key"] for c in body["categories"]]
+        assert keys == ["systemPrompt", "skills", "tools", "summary", "messages"]
+        by_key = {c["key"]: c for c in body["categories"]}
+        # 阶段确认模式的系统提示词包含阶段协议，应明显非零
+        assert by_key["systemPrompt"]["tokens"] > 0
+        assert by_key["messages"]["tokens"] == 0
+        assert all(c["percent"] >= 0 for c in body["categories"])
+
+    def test_usage_reflects_session_model(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        big_model = create_model(client, contextLength=131072, displayName="大杯", modelIdentifier="big-1")
+        session = create_session(client, agent_id=agent["id"])
+
+        default_usage = client.get(f"/api/chat/sessions/{session['id']}/context-usage").json()
+        assert default_usage["contextLength"] == 32768
+        client.put(f"/api/chat/sessions/{session['id']}/model", json={"modelId": big_model["id"]})
+        overridden = client.get(f"/api/chat/sessions/{session['id']}/context-usage").json()
+
+        assert overridden["contextLength"] == 131072
+
+    def test_usage_without_agent_is_conflict(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+        assert client.delete(f"/api/agents/{agent['id']}").status_code in (200, 204)
+
+        response = client.get(f"/api/chat/sessions/{session['id']}/context-usage")
+
+        assert response.status_code == 409
+
+    def test_usage_missing_session_is_404(self, client: TestClient) -> None:
+        assert client.get("/api/chat/sessions/999/context-usage").status_code == 404

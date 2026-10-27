@@ -45,7 +45,10 @@ class ScoringRequestError(Exception):
         self.error_type = error.error_type
 
 
-SCORING_MAX_TOKENS = 1024
+# 评分正文只有一个 JSON，但思考型模型的 reasoning token 计入 completion
+# （DeepSeek 文档：思考 token 计入完成量，非思考模式默认 8K、思考模式默认 64K）；
+# 输出预算被思考吃光时正文为空，取 64K（官方思考模式默认值）。
+SCORING_MAX_TOKENS = 65536
 SCORING_TIMEOUT_SECONDS = 120.0
 # 单次评分最多尝试次数：首次 + 校验失败后的一次重试
 SCORING_MAX_ATTEMPTS = 2

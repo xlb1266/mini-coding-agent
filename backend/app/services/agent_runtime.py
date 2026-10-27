@@ -124,6 +124,7 @@ from app.services.skill_store import (
     parse_skill_markdown,
 )
 from app.services.token_estimation import (
+    MESSAGE_OVERHEAD_TOKENS,
     estimate_messages_tokens,
     estimate_tokens,
 )
@@ -339,6 +340,11 @@ class RuntimeRequest:
     汇总会话创建时把项目钉住的目录写上会话，调用方传入后 Runtime 优先
     使用（文件沙箱根与 Shell 工作目录跟随），保证多会话操作同一工作区；
     空串表示回落 Agent 配置的工作区。
+
+    model_id / approval_level / autonomy_mode 为会话级覆盖（聊天输入框
+    切换）：由调用方从会话上读出后传入，只影响本次运行；None / 空串表示
+    跟随 Agent 配置。覆盖值来自用户在聊天页的显式选择，允许比 Agent
+    默认更宽松（如关闭审批），不属于"静默放宽"。
     """
 
     agent_id: int
@@ -350,6 +356,10 @@ class RuntimeRequest:
     persist_summary: Callable[[str, int], None] | None = None
     approval: ApprovalHooks | None = None
     workspace_dir: str = ""
+    # 会话级覆盖：模型 id / 审批档位 / 自主档位；空表示跟随 Agent 配置
+    model_id: int | None = None
+    approval_level: str = ""
+    autonomy_mode: str = ""
 
 
 @dataclass
@@ -695,6 +705,194 @@ def _stage_protocol_section() -> str:
     ])
 
 
+def _load_skill_descriptor(name: str) -> dict[str, Any]:
+    """load_skill 工具的模型可见描述符（注册表与上下文估算共用）。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": (
+                "加载指定 Skill 的完整指令。当任务符合某个 Skill 的用途时，先调用本工具"
+                "加载其完整指令，再严格按照指令执行任务。skill_id 必须使用系统提示词中"
+                "「可用 Skills」列出的稳定标识，不能填写任意文件路径。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": "Skill 的稳定标识，见系统提示词中的可用 Skills 列表",
+                    }
+                },
+                "required": ["skill_id"],
+            },
+        },
+    }
+
+
+def _submit_stage_plan_descriptor(name: str) -> dict[str, Any]:
+    """submit_stage_plan 工具的模型可见描述符（注册表与上下文估算共用）。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": (
+                "提交阶段化开发计划（仅用于从 0 到 1 的开发需求：分析需求后"
+                "先提交计划，不要直接开始写代码）。提交后本次运行结束，等待"
+                "用户确认；存量项目的增量开发与问答不要调用本工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "项目标题，例如「待办清单 Web 应用」",
+                    },
+                    "stages": {
+                        "type": "array",
+                        "description": "阶段清单，2–8 项，按实施顺序排列",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": "阶段名称，例如「阶段一：项目骨架」",
+                                },
+                                "goal": {
+                                    "type": "string",
+                                    "description": "该阶段的完成目标（做成什么样算完成）",
+                                },
+                            },
+                            "required": ["name", "goal"],
+                        },
+                    },
+                },
+                "required": ["title", "stages"],
+            },
+        },
+    }
+
+
+def _finish_stage_descriptor(name: str) -> dict[str, Any]:
+    """finish_stage 工具的模型可见描述符（注册表与上下文估算共用）。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": (
+                "结束当前开发阶段（仅在完成交接文档并自检后调用）。调用后本次运行结束，"
+                "等待用户验收；验收通过后用户会让你继续下一阶段。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stageName": {
+                        "type": "string",
+                        "description": "本阶段名称，例如「阶段一：项目骨架」",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "本阶段成果概述（做了什么、验证结果）",
+                    },
+                    "handoffPath": {
+                        "type": "string",
+                        "description": "交接文档在工作区内的相对路径，例如 handoff-阶段一.md",
+                    },
+                    "nextStep": {
+                        "type": "string",
+                        "description": "下一阶段的建议内容",
+                    },
+                },
+                "required": ["stageName", "summary", "handoffPath", "nextStep"],
+            },
+        },
+    }
+
+
+def _effective_system_prompt(system_prompt: str, skills: list[_SkillMeta], autonomy_mode: str) -> str:
+    """拼装实际下发的系统提示词：Agent 提示词 + 技能目录 + 阶段工作流协议。
+
+    与 _build_context_plan 的组装顺序一致（目录在协议之前）；供运行与
+    上下文估算共用，保证两处口径一致。
+    """
+    system = system_prompt
+    if skills:
+        section = _skill_catalog_section(skills)
+        system = f"{system.rstrip()}\n\n{section}" if system.strip() else section
+    if autonomy_mode == AUTONOMY_STAGE_CONFIRM:
+        section = _stage_protocol_section()
+        system = f"{system.rstrip()}\n\n{section}" if system.strip() else section
+    return system
+
+
+def estimate_fixed_context(db: Any, agent: Agent, autonomy_mode: str) -> dict[str, int]:
+    """估算一次运行"固定部分"的上下文占用（估算口径，见 token_estimation）。
+
+    与 _build_context_plan / _build_registry 同一套组装：系统提示词（含
+    阶段工作流协议）、技能目录、内置工具定义（含 load_skill 与阶段确认
+    模式下的规划/收尾工具）。返回 {"systemPrompt", "skills", "tools"} 三个
+    估算项。MCP 工具定义需连接后才能发现，不在估算范围内；聊天页的
+    上下文占用量接口复用本函数。
+    """
+    tool_keys = {b.ref_key for b in agent.bindings if b.capability_type == CAPABILITY_TOOL}
+    tool_rows: dict[str, Tool] = {}
+    if tool_keys:
+        rows = (
+            db.query(Tool)
+            .filter(Tool.key.in_(tool_keys), Tool.enabled.is_(True))
+            .order_by(Tool.id)
+            .all()
+        )
+        tool_rows = {row.key: row for row in rows}
+
+    skill_names = {b.ref_key for b in agent.bindings if b.capability_type == CAPABILITY_SKILL}
+    skills: list[_SkillMeta] = []
+    if skill_names:
+        for row in (
+            db.query(Skill)
+            .filter(Skill.dir_name.in_(skill_names), Skill.enabled.is_(True))
+            .order_by(Skill.dir_name)
+            .all()
+        ):
+            skills.append(_SkillMeta(dir_name=row.dir_name, name=row.name, description=row.description))
+
+    mode = autonomy_mode if autonomy_mode in AUTONOMY_MODES else AUTONOMY_STAGE_CONFIRM
+    # 技能目录单独计一类（运行时与系统提示词以空行相连，这里省略的两个
+    # 连接字符对估算的影响可忽略）
+    system = agent.system_prompt
+    if mode == AUTONOMY_STAGE_CONFIRM:
+        section = _stage_protocol_section()
+        system = f"{system.rstrip()}\n\n{section}" if system.strip() else section
+    skills_tokens = 0
+    if skills:
+        skills_tokens = estimate_tokens(_skill_catalog_section(skills)) + MESSAGE_OVERHEAD_TOKENS
+    system_tokens = estimate_tokens(system) + MESSAGE_OVERHEAD_TOKENS if system.strip() else 0
+
+    descriptors: list[dict[str, Any]] = []
+    for key in tool_rows:
+        definition = get_definition(key)
+        if definition is None:
+            continue
+        descriptors.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": _sanitize_tool_name(key),
+                    "description": definition.description,
+                    "parameters": _builtin_parameters(definition.params),
+                },
+            }
+        )
+    if skills:
+        descriptors.append(_load_skill_descriptor(LOAD_SKILL_TOOL_NAME))
+    if mode == AUTONOMY_STAGE_CONFIRM:
+        descriptors.append(_submit_stage_plan_descriptor(SUBMIT_STAGE_PLAN_TOOL_NAME))
+        descriptors.append(_finish_stage_descriptor(FINISH_STAGE_TOOL_NAME))
+    # estimate_messages_tokens 内部已计每个工具定义的固定开销
+    tools_tokens = estimate_messages_tokens([], descriptors) if descriptors else 0
+    return {"systemPrompt": system_tokens, "skills": skills_tokens, "tools": tools_tokens}
+
+
 @dataclass
 class _ContextPlan:
     """一次运行发给模型的消息布局。
@@ -999,14 +1197,26 @@ class AgentRuntime:
     # ---- 配置加载 ----
 
     def _load_config(self, request: RuntimeRequest) -> _LoadedConfig:
-        """加载 Agent 配置并应用运行级限制（只收窄，不授予）。"""
+        """加载 Agent 配置并应用运行级限制（只收窄，不授予）。
+
+        会话级覆盖（model_id / approval_level / autonomy_mode）来自用户在
+        聊天页的显式选择：模型可换成任意已配置模型，档位可宽可窄；其余
+        限制（max_rounds、工具绑定、压缩配置）仍以 Agent 配置为准。
+        """
         db = self._session_factory()
         try:
             agent = db.get(Agent, request.agent_id)
             if agent is None:
                 raise _ConfigError(f"Agent（id={request.agent_id}）不存在或已被删除")
-            model = db.get(ModelConfig, agent.model_id)
+            effective_model_id = request.model_id if request.model_id else agent.model_id
+            model = db.get(ModelConfig, effective_model_id)
             if model is None:
+                if request.model_id:
+                    raise _ConfigError(
+                        "本次会话使用的模型不存在或已被删除",
+                        agent_name=agent.name,
+                        hint="请在聊天页重新选择模型，或切换回 Agent 配置的模型",
+                    )
                 raise _ConfigError(
                     f"Agent「{agent.name}」配置的模型已被删除",
                     agent_name=agent.name,
@@ -1102,8 +1312,16 @@ class AgentRuntime:
             # 写上会话，调用方经 RuntimeRequest.workspace_dir 传入
             workspace_dir = (request.workspace_dir or "").strip() or (agent.workspace_dir or "").strip()
             tool_context = ToolContext(workspace_root=Path(workspace_dir)) if workspace_dir else None
-            approval_level = agent.approval_level if agent.approval_level in APPROVAL_LEVELS else APPROVAL_OFF
-            autonomy_mode = agent.autonomy_mode if agent.autonomy_mode in AUTONOMY_MODES else AUTONOMY_STAGE_CONFIRM
+            approval_level = (
+                request.approval_level
+                if request.approval_level in APPROVAL_LEVELS
+                else (agent.approval_level if agent.approval_level in APPROVAL_LEVELS else APPROVAL_OFF)
+            )
+            autonomy_mode = (
+                request.autonomy_mode
+                if request.autonomy_mode in AUTONOMY_MODES
+                else (agent.autonomy_mode if agent.autonomy_mode in AUTONOMY_MODES else AUTONOMY_STAGE_CONFIRM)
+            )
             return _LoadedConfig(
                 agent_id=agent.id,
                 agent_name=agent.name,
@@ -1164,27 +1382,7 @@ class AgentRuntime:
                 name=name,
                 tool_type=TOOL_TYPE_SKILL,
                 display_name="加载 Skill",
-                descriptor={
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": (
-                            "加载指定 Skill 的完整指令。当任务符合某个 Skill 的用途时，先调用本工具"
-                            "加载其完整指令，再严格按照指令执行任务。skill_id 必须使用系统提示词中"
-                            "「可用 Skills」列出的稳定标识，不能填写任意文件路径。"
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "skill_id": {
-                                    "type": "string",
-                                    "description": "Skill 的稳定标识，见系统提示词中的可用 Skills 列表",
-                                }
-                            },
-                            "required": ["skill_id"],
-                        },
-                    },
-                },
+                descriptor=_load_skill_descriptor(name),
             )
 
         if config.autonomy_mode == AUTONOMY_STAGE_CONFIRM:
@@ -1197,45 +1395,7 @@ class AgentRuntime:
                 tool_type=TOOL_TYPE_BUILTIN,
                 display_name="提交阶段计划",
                 ref_key=SUBMIT_STAGE_PLAN_TOOL_NAME,
-                descriptor={
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": (
-                            "提交阶段化开发计划（仅用于从 0 到 1 的开发需求：分析需求后"
-                            "先提交计划，不要直接开始写代码）。提交后本次运行结束，等待"
-                            "用户确认；存量项目的增量开发与问答不要调用本工具。"
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "title": {
-                                    "type": "string",
-                                    "description": "项目标题，例如「待办清单 Web 应用」",
-                                },
-                                "stages": {
-                                    "type": "array",
-                                    "description": "阶段清单，2–8 项，按实施顺序排列",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "name": {
-                                                "type": "string",
-                                                "description": "阶段名称，例如「阶段一：项目骨架」",
-                                            },
-                                            "goal": {
-                                                "type": "string",
-                                                "description": "该阶段的完成目标（做成什么样算完成）",
-                                            },
-                                        },
-                                        "required": ["name", "goal"],
-                                    },
-                                },
-                            },
-                            "required": ["title", "stages"],
-                        },
-                    },
-                },
+                descriptor=_submit_stage_plan_descriptor(name),
             )
             # 阶段确认模式（阶段十五）：提供 finish_stage 收尾工具。
             # 调用后本次运行以 stage_complete 结束，等待用户验收，不进入执行入口。
@@ -1245,38 +1405,7 @@ class AgentRuntime:
                 tool_type=TOOL_TYPE_BUILTIN,
                 display_name="结束当前阶段",
                 ref_key=FINISH_STAGE_TOOL_NAME,
-                descriptor={
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": (
-                            "结束当前开发阶段（仅在完成交接文档并自检后调用）。调用后本次运行结束，"
-                            "等待用户验收；验收通过后用户会让你继续下一阶段。"
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "stageName": {
-                                    "type": "string",
-                                    "description": "本阶段名称，例如「阶段一：项目骨架」",
-                                },
-                                "summary": {
-                                    "type": "string",
-                                    "description": "本阶段成果概述（做了什么、验证结果）",
-                                },
-                                "handoffPath": {
-                                    "type": "string",
-                                    "description": "交接文档在工作区内的相对路径，例如 handoff-阶段一.md",
-                                },
-                                "nextStep": {
-                                    "type": "string",
-                                    "description": "下一阶段的建议内容",
-                                },
-                            },
-                            "required": ["stageName", "summary", "handoffPath", "nextStep"],
-                        },
-                    },
-                },
+                descriptor=_finish_stage_descriptor(name),
             )
 
         for server_cfg in config.mcp_servers:
@@ -1331,14 +1460,7 @@ class AgentRuntime:
         也只让有效消息进入上下文；摘要以背景消息的形式单独一条，不与
         Agent 系统提示词混合。
         """
-        system = config.system_prompt
-        if config.skills:
-            section = _skill_catalog_section(config.skills)
-            system = f"{system.rstrip()}\n\n{section}" if system.strip() else section
-        if config.autonomy_mode == AUTONOMY_STAGE_CONFIRM:
-            # 阶段确认模式：附加阶段化工作流协议（交接文档 + finish_stage 收尾）
-            section = _stage_protocol_section()
-            system = f"{system.rstrip()}\n\n{section}" if system.strip() else section
+        system = _effective_system_prompt(config.system_prompt, config.skills, config.autonomy_mode)
         boundary = request.summary_boundary_seq
         history: list[dict[str, Any]] = []
         for item in request.history:

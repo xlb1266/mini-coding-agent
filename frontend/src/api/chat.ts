@@ -46,8 +46,83 @@ export interface ChatSessionSummary {
   projectRole?: 'plan' | 'stage' | 'summary' | null
   /** 本会话负责的项目阶段序号（1-based）；规划与汇总会话为 null */
   stageIndex?: number | null
+  /** 会话级审批档位覆盖（输入框切换）；null = 跟随 Agent 配置 */
+  approvalLevel?: ApprovalLevel | null
+  /** 会话级自主档位覆盖；null = 跟随 Agent 配置 */
+  autonomyMode?: AutonomyMode | null
+  /** 会话级模型覆盖；null = 跟随 Agent 绑定的模型 */
+  modelId?: number | null
   createdAt: string
   updatedAt: string
+}
+
+/** 审批档位（与 agents 模块一致）：off 不审批 / standard 高风险审批 / strict 全部审批。 */
+export type ApprovalLevel = 'off' | 'standard' | 'strict'
+
+/** 自主档位（与 agents 模块一致）：stage_confirm 阶段确认 / autonomous 高度自主。 */
+export type AutonomyMode = 'stage_confirm' | 'autonomous'
+
+/** 聊天输入框的执行档位预设：审批档位 × 自主档位的组合。 */
+export interface ModePreset {
+  key: string
+  label: string
+  description: string
+  approvalLevel: ApprovalLevel
+  autonomyMode: AutonomyMode
+}
+
+/** 三个执行档位预设（与后端治理模型对应）；展示顺序按自由度从高到低。 */
+export const MODE_PRESETS: ModePreset[] = [
+  {
+    key: 'autonomous_full',
+    label: '高度自主',
+    description: '完全访问，无审批操作。',
+    approvalLevel: 'off',
+    autonomyMode: 'autonomous',
+  },
+  {
+    key: 'stage_confirm',
+    label: '阶段确认模式',
+    description: '做完一个阶段生成交接文档并停下，等你验收后继续。',
+    approvalLevel: 'off',
+    autonomyMode: 'stage_confirm',
+  },
+  {
+    key: 'confirm_changes',
+    label: '变更前确认',
+    description: '执行命令、修改文件前先请求人工审批。',
+    approvalLevel: 'standard',
+    autonomyMode: 'stage_confirm',
+  },
+]
+
+/** 根据审批档位与自主档位组合找出对应的预设；组合不匹配任何预设时返回 null。 */
+export function matchModePreset(
+  approvalLevel: ApprovalLevel | null | undefined,
+  autonomyMode: AutonomyMode | null | undefined,
+): ModePreset | null {
+  return (
+    MODE_PRESETS.find(
+      (preset) => preset.approvalLevel === approvalLevel && preset.autonomyMode === autonomyMode,
+    ) ?? null
+  )
+}
+
+/** 上下文占用量的一个分类（估算值）。 */
+export interface ContextUsageCategory {
+  key: string
+  label: string
+  tokens: number
+  percent: number
+}
+
+/** 会话上下文占用量（估算口径，不含下次输入与未连接的 MCP 工具定义）。 */
+export interface ContextUsage {
+  estimatedTokens: number
+  contextLength: number
+  availableInputTokens: number
+  categories: ContextUsageCategory[]
+  hasMcpTools: boolean
 }
 
 /** 阶段项目（阶段化开发 v2）：阶段清单与推进状态。 */
@@ -422,6 +497,28 @@ export function getChatMessages(sessionId: number): Promise<ChatMessagesResult> 
 /** 切换会话当前选择的 Agent。 */
 export function selectChatAgent(sessionId: number, agentId: number): Promise<ChatSessionSummary> {
   return put<ChatSessionSummary>(`/api/chat/sessions/${sessionId}/agent`, { agentId })
+}
+
+/** 切换会话的执行档位（审批档位 × 自主档位组合），只影响当前会话。 */
+export function selectChatMode(
+  sessionId: number,
+  approvalLevel: ApprovalLevel,
+  autonomyMode: AutonomyMode,
+): Promise<ChatSessionSummary> {
+  return put<ChatSessionSummary>(`/api/chat/sessions/${sessionId}/mode`, {
+    approvalLevel,
+    autonomyMode,
+  })
+}
+
+/** 切换会话使用的模型（会话级覆盖，只影响当前会话）。 */
+export function selectChatModel(sessionId: number, modelId: number): Promise<ChatSessionSummary> {
+  return put<ChatSessionSummary>(`/api/chat/sessions/${sessionId}/model`, { modelId })
+}
+
+/** 会话上下文占用量（估算口径）。 */
+export function getChatContextUsage(sessionId: number): Promise<ContextUsage> {
+  return get<ContextUsage>(`/api/chat/sessions/${sessionId}/context-usage`)
 }
 
 /** 发送用户消息；成功后回复生成已在后台开始。 */

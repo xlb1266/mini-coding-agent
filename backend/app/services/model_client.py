@@ -260,7 +260,9 @@ def _create_async_client(timeout: float) -> httpx.AsyncClient:
 
 # 通用非流式请求的默认超时与输出上限（评分等结构化调用使用）
 GENERAL_TIMEOUT_SECONDS = 120.0
-GENERAL_MAX_TOKENS_LIMIT = 8192
+# 思考型模型的 reasoning token 计入 completion，输出预算过小会导致正文为空；
+# 上限对齐 DeepSeek 思考模式的默认输出额度（64K），调用方按需传更小的值。
+GENERAL_MAX_TOKENS_LIMIT = 65536
 
 
 async def chat_completion_text(

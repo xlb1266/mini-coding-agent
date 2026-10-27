@@ -48,9 +48,13 @@ from app.schemas.chat import (
     ChatApprovalDecisionResultOut,
     ChatApprovalListOut,
     ChatApprovalOut,
+    ChatContextCategoryOut,
+    ChatContextUsageOut,
     ChatGenerationOut,
     ChatMessageOut,
     ChatMessagesOut,
+    ChatModeSelectRequest,
+    ChatModelSelectRequest,
     ChatSendRequest,
     ChatSendResultOut,
     ChatSessionCreateRequest,
@@ -61,7 +65,9 @@ from app.schemas.chat import (
     StageProjectStageOut,
 )
 from app.api.routes.skills import get_skills_dir
+from app.db.models.agent import APPROVAL_LEVELS, AUTONOMY_MODES, CAPABILITY_MCP
 from app.services.approvals import approval_registry
+from app.services.agent_runtime import estimate_fixed_context
 from app.services.chat_generation import (
     TERMINAL_EVENTS,
     estimate_context_tokens,
@@ -73,7 +79,10 @@ from app.services.chat_generation import (
     next_seq,
     utcnow,
 )
-from app.services.token_estimation import available_input_tokens
+from app.services.token_estimation import (
+    MESSAGE_OVERHEAD_TOKENS,
+    available_input_tokens,
+)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -123,6 +132,9 @@ def _session_out(db: Session, session: ChatSession) -> ChatSessionOut:
         project_id=session.project_id,
         project_role=session.project_role,
         stage_index=session.stage_index,
+        approval_level=session.approval_level,
+        autonomy_mode=session.autonomy_mode,
+        model_id=session.model_id,
         created_at=session.created_at,
         updated_at=session.updated_at,
     )
@@ -156,6 +168,9 @@ def list_sessions(db: Session = Depends(get_db)) -> list[ChatSessionOut]:
                 project_id=s.project_id,
                 project_role=s.project_role,
                 stage_index=s.stage_index,
+                approval_level=s.approval_level,
+                autonomy_mode=s.autonomy_mode,
+                model_id=s.model_id,
                 created_at=s.created_at,
                 updated_at=s.updated_at,
             )
@@ -254,6 +269,113 @@ def select_session_agent(
     return _session_out(db, session)
 
 
+@router.put("/sessions/{session_id}/mode")
+def select_session_mode(
+    session_id: int,
+    payload: ChatModeSelectRequest,
+    db: Session = Depends(get_db),
+) -> ChatSessionOut:
+    """切换会话的执行档位（审批档位 × 自主档位的预设组合），会话级覆盖。
+
+    覆盖值保存在会话上，只影响本会话后续请求；新会话仍沿用 Agent 配置。
+    生成中不允许切换。
+    """
+    session = _get_session_or_404(db, session_id)
+    if generation_manager.is_generating(session_id):
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="当前会话正在生成回复，请等待完成或先停止生成")
+    if payload.approval_level not in APPROVAL_LEVELS or payload.autonomy_mode not in AUTONOMY_MODES:
+        raise HTTPException(
+            status_code=FIELD_ERROR_STATUS,
+            detail={"message": "档位取值不合法", "fields": {"approvalLevel": "审批档位或自主档位取值不合法"}},
+        )
+    session.approval_level = payload.approval_level
+    session.autonomy_mode = payload.autonomy_mode
+    db.commit()
+    db.refresh(session)
+    return _session_out(db, session)
+
+
+@router.put("/sessions/{session_id}/model")
+def select_session_model(
+    session_id: int,
+    payload: ChatModelSelectRequest,
+    db: Session = Depends(get_db),
+) -> ChatSessionOut:
+    """切换会话使用的模型（会话级覆盖，只影响本会话后续请求）。
+
+    生成中不允许切换；模型必须存在于模型管理，否则 422。
+    """
+    session = _get_session_or_404(db, session_id)
+    if generation_manager.is_generating(session_id):
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="当前会话正在生成回复，请等待完成或先停止生成")
+    model = db.get(ModelConfig, payload.model_id)
+    if model is None:
+        raise HTTPException(
+            status_code=FIELD_ERROR_STATUS,
+            detail={"message": "所选模型不存在或已被删除", "fields": {"modelId": "所选模型不存在或已被删除"}},
+        )
+    session.model_id = payload.model_id
+    db.commit()
+    db.refresh(session)
+    return _session_out(db, session)
+
+
+@router.get("/sessions/{session_id}/context-usage")
+def get_context_usage(session_id: int, db: Session = Depends(get_db)) -> ChatContextUsageOut:
+    """会话上下文占用量（估算口径，非模型实际用量）。
+
+    与 Runtime 的请求组装同一套逻辑：系统提示词（含阶段协议）、技能目录、
+    内置工具定义、会话摘要与压缩边界之后的有效历史；不含下次输入与未
+    连接的 MCP 工具定义。会话未绑定 Agent 时无法估算，返回 409。
+    """
+    session = _get_session_or_404(db, session_id)
+    agent = db.get(Agent, session.agent_id) if session.agent_id is not None else None
+    if agent is None:
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="会话未绑定 Agent，无法估算上下文占用")
+    model = db.get(ModelConfig, session.model_id or agent.model_id)
+    if model is None:
+        raise HTTPException(status_code=CONFLICT_STATUS, detail="会话使用的模型不存在或已被删除，无法估算上下文占用")
+
+    autonomy_mode = session.autonomy_mode or agent.autonomy_mode
+    fixed = estimate_fixed_context(db, agent, autonomy_mode)
+
+    boundary = session.summary_boundary_seq
+    history = load_effective_history(db, session_id)
+    messages_tokens = sum(
+        estimate_tokens(item.content) + MESSAGE_OVERHEAD_TOKENS
+        for item in history
+        if boundary is None or item.seq > boundary
+    )
+    summary_text = session.summary_text or ""
+    summary_tokens = (estimate_tokens(summary_text) + MESSAGE_OVERHEAD_TOKENS) if summary_text else 0
+
+    raw_categories = [
+        ("systemPrompt", "系统提示词", fixed["systemPrompt"]),
+        ("skills", "技能", fixed["skills"]),
+        ("tools", "工具定义", fixed["tools"]),
+        ("summary", "会话摘要", summary_tokens),
+        ("messages", "消息", messages_tokens),
+    ]
+    context_length = model.context_length
+    categories = [
+        ChatContextCategoryOut(
+            key=key,
+            label=label,
+            tokens=tokens,
+            percent=round(tokens * 100.0 / context_length, 1) if context_length > 0 else 0.0,
+        )
+        for key, label, tokens in raw_categories
+    ]
+    has_mcp = any(binding.capability_type == CAPABILITY_MCP for binding in agent.bindings)
+    return ChatContextUsageOut(
+        estimated_tokens=sum(item.tokens for item in categories),
+        context_length=context_length,
+        available_input_tokens=available_input_tokens(model.context_length, model.max_output_tokens),
+        categories=categories,
+        has_mcp_tools=has_mcp,
+    )
+
+
 def start_session_generation(
     db: Session,
     session: ChatSession,
@@ -281,12 +403,28 @@ def start_session_generation(
             status_code=CONFLICT_STATUS,
             detail="会话当前选择的 Agent 不存在或已被删除，请先选择一个可用 Agent",
         )
-    model = db.get(ModelConfig, agent.model_id)
+    # 会话级覆盖（聊天输入框切换）：模型与档位优先用会话上的值，空则跟随 Agent
+    model = db.get(ModelConfig, session.model_id or agent.model_id)
     if model is None:
+        if session.model_id:
+            raise HTTPException(
+                status_code=CONFLICT_STATUS,
+                detail="会话当前选择的模型已被删除，请在输入框重新选择模型",
+            )
         raise HTTPException(
             status_code=CONFLICT_STATUS,
             detail=f"Agent「{agent.name}」配置的模型已被删除，请先更换模型或切换 Agent",
         )
+    approval_level = (
+        session.approval_level
+        if session.approval_level in APPROVAL_LEVELS
+        else agent.approval_level
+    )
+    autonomy_mode = (
+        session.autonomy_mode
+        if session.autonomy_mode in AUTONOMY_MODES
+        else agent.autonomy_mode
+    )
 
     api_key: str | None = None
     if model.secret is not None:
@@ -377,7 +515,8 @@ def start_session_generation(
         model_id=model.id,
         model_name=model.display_name,
         model_identifier=model.model_identifier,
-        approval_level=agent.approval_level,
+        approval_level=approval_level,
+        autonomy_mode=autonomy_mode,
         workspace_dir=(session.workspace_dir or "").strip(),
     )
 

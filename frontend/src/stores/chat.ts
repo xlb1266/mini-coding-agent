@@ -36,11 +36,15 @@ import {
   nextStageProject as apiNextStageProject,
   openChatEventStream,
   selectChatAgent as apiSelectAgent,
+  selectChatMode as apiSelectMode,
+  selectChatModel as apiSelectModel,
   sendChatMessage as apiSendMessage,
   startStageProject as apiStartStageProject,
   stopChatGeneration as apiStopGeneration,
   summarizeStageProject as apiSummarizeStageProject,
   type ApprovalDecisionStatus,
+  type ApprovalLevel,
+  type AutonomyMode,
   type ChatEvent,
   type ChatGeneration,
   type ChatMessage,
@@ -530,6 +534,28 @@ export const useChatStore = defineStore('chat', {
         throw new Error('当前会话正在生成回复，请等待完成或先停止')
       }
       const updated = await apiSelectAgent(sessionId, agentId)
+      this.syncSession(updated)
+    },
+
+    /** 切换会话的执行档位（会话级覆盖，只影响当前会话）。 */
+    async changeMode(
+      sessionId: number,
+      approvalLevel: ApprovalLevel,
+      autonomyMode: AutonomyMode,
+    ): Promise<void> {
+      if (this.generations[sessionId]) {
+        throw new Error('当前会话正在生成回复，请等待完成或先停止')
+      }
+      const updated = await apiSelectMode(sessionId, approvalLevel, autonomyMode)
+      this.syncSession(updated)
+    },
+
+    /** 切换会话使用的模型（会话级覆盖，只影响当前会话）。 */
+    async changeModel(sessionId: number, modelId: number): Promise<void> {
+      if (this.generations[sessionId]) {
+        throw new Error('当前会话正在生成回复，请等待完成或先停止')
+      }
+      const updated = await apiSelectModel(sessionId, modelId)
       this.syncSession(updated)
     },
 

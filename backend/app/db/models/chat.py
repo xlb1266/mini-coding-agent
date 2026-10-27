@@ -66,6 +66,15 @@ class ChatSession(Base):
     # 项目钉住的工作区目录：项目下的会话创建时继承，Runtime 以本目录优先
     # 执行（保证多会话操作同一工作区）；普通会话为 NULL，跟随 Agent 配置
     workspace_dir: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # ---- 会话级档位与模型覆盖（聊天输入框切换用；NULL = 跟随 Agent 配置） ----
+    # 审批档位：off / standard / strict；空为跟随 Agent
+    approval_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 自主档位：stage_confirm / autonomous；空为跟随 Agent
+    autonomy_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 本次会话使用的模型；空为跟随 Agent 绑定的模型
+    model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("model_configs.id"), nullable=True
+    )
 
     messages: Mapped[list["ChatMessage"]] = relationship(
         back_populates="session",

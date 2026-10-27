@@ -27,14 +27,28 @@ vi.mock('../../api/agents', () => ({
   setDefaultAgent: vi.fn(),
 }))
 
-vi.mock('../../api/chat', () => ({
+// 保留 matchModePreset / MODE_PRESETS 等纯逻辑导出，只替换网络请求函数
+vi.mock('../../api/chat', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../api/chat')>()),
   listChatSessions: vi.fn(),
   createChatSession: vi.fn(),
   getChatMessages: vi.fn(),
   selectChatAgent: vi.fn(),
+  selectChatMode: vi.fn(),
+  selectChatModel: vi.fn(),
+  getChatContextUsage: vi.fn().mockRejectedValue(new Error('not mocked')),
   sendChatMessage: vi.fn(),
   stopChatGeneration: vi.fn(),
   openChatEventStream: vi.fn(),
+}))
+
+vi.mock('../../api/models', () => ({
+  listModels: vi.fn().mockResolvedValue([]),
+  createModel: vi.fn(),
+  updateModel: vi.fn(),
+  deleteModel: vi.fn(),
+  setDefaultModel: vi.fn(),
+  testModel: vi.fn(),
 }))
 
 function makeAgent(): AgentItem {
@@ -254,9 +268,9 @@ describe('ChatView 发送与停止', () => {
     const wrapper = await mountView()
     const textarea = wrapper.find('textarea')
     await textarea.setValue('   ')
-    const button = wrapper.findAll('button').find((b) => b.text() === '发送')
+    const button = wrapper.find('.send-button')
 
-    expect(button!.attributes('disabled')).toBeDefined()
+    expect(button.attributes('disabled')).toBeDefined()
   })
 
   it('发送失败时保留输入内容并提示原因', async () => {
@@ -293,10 +307,11 @@ describe('ChatView 发送与停止', () => {
 
     expect(wrapper.text()).toContain('正在思考')
     expect(wrapper.find('.agent-select').attributes('disabled')).toBeDefined()
-    const stopButton = wrapper.findAll('button').find((b) => b.text() === '停止生成')
-    expect(stopButton).toBeTruthy()
+    // 生成中输入框右下角的发送按钮切换为停止按钮（图标态）
+    const stopButton = wrapper.find('.send-button.is-stop')
+    expect(stopButton.exists()).toBe(true)
 
-    await stopButton!.trigger('click')
+    await stopButton.trigger('click')
     await flushPromises()
 
     expect(stopChatGeneration).toHaveBeenCalledWith(1)

@@ -17,8 +17,6 @@ import {
   findMissingBindings,
   COMPACT_KEEP_ROUNDS_MAX,
   COMPACT_KEEP_ROUNDS_MIN,
-  APPROVAL_LEVEL_OPTIONS,
-  AUTONOMY_MODE_OPTIONS,
   COMPACT_SUMMARY_TOKENS_MAX,
   COMPACT_SUMMARY_TOKENS_MIN,
   COMPACT_THRESHOLD_MAX,
@@ -288,18 +286,7 @@ function bindingBadge(binding: AgentBindingRef): string {
       </div>
 
       <div class="form-field approval-section">
-        <label>审批档位</label>
-        <select v-model="values.approvalLevel" class="governance-select">
-          <option v-for="option in APPROVAL_LEVEL_OPTIONS" :key="option.value" :value="option.value">
-            {{ option.label }}
-          </option>
-        </select>
-        <p class="field-hint">
-          当前档位：{{ APPROVAL_LEVEL_OPTIONS.find((o) => o.value === values.approvalLevel)?.hint }}。
-          命中审批的调用会暂停并在聊天页展示审批卡片，等你批准或拒绝；拒绝与超时（默认 300 秒）都会把结果告知模型。
-        </p>
-        <p v-if="errors.approvalLevel" class="field-error">{{ errors.approvalLevel }}</p>
-        <label class="governance-sublabel">Shell 命令白名单（可选）</label>
+        <label>Shell 命令白名单（可选）</label>
         <textarea
           v-model="values.shellWhitelist"
           class="governance-textarea"
@@ -309,22 +296,9 @@ function bindingBadge(binding: AgentBindingRef): string {
         <p class="field-hint">
           按行或逗号分隔的命令前缀；Agent 执行的 Shell 命令以白名单前缀开头时跳过审批直接执行。
           危险命令黑名单仍然生效，白名单只跳过人工审批这一层。
+          执行档位（审批 × 自主工作流）在聊天页输入框左下角切换，只影响所在会话；新会话沿用 Agent 当前档位。
         </p>
         <p v-if="errors.shellWhitelist" class="field-error">{{ errors.shellWhitelist }}</p>
-      </div>
-
-      <div class="form-field approval-section">
-        <label>自主档位</label>
-        <select v-model="values.autonomyMode" class="governance-select">
-          <option v-for="option in AUTONOMY_MODE_OPTIONS" :key="option.value" :value="option.value">
-            {{ option.label }}
-          </option>
-        </select>
-        <p class="field-hint">
-          当前档位：{{ AUTONOMY_MODE_OPTIONS.find((o) => o.value === values.autonomyMode)?.hint }}。
-          阶段确认模式下 Agent 会按「开发 → 自检 → 交接文档 → finish_stage」收尾，聊天页出现验收横幅。
-        </p>
-        <p v-if="errors.autonomyMode" class="field-error">{{ errors.autonomyMode }}</p>
       </div>
 
       <div class="form-field compact-section">

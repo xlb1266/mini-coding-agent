@@ -35,6 +35,45 @@ class ChatAgentSelectRequest(CamelModel):
     agent_id: int
 
 
+class ChatModeSelectRequest(CamelModel):
+    """切换会话的执行档位：审批档位与自主档位的预设组合（会话级覆盖）。"""
+
+    approval_level: str
+    autonomy_mode: str
+
+
+class ChatModelSelectRequest(CamelModel):
+    """切换会话使用的模型（会话级覆盖）。"""
+
+    model_id: int
+
+
+class ChatContextCategoryOut(CamelModel):
+    """上下文占用的一个分类：估算 Token 与占总上下文长度的百分比。"""
+
+    key: str
+    label: str
+    tokens: int
+    percent: float
+
+
+class ChatContextUsageOut(CamelModel):
+    """会话上下文占用量（估算口径，见 token_estimation）。
+
+    estimatedTokens 为下次请求的估算输入（系统提示词 + 技能目录 + 工具
+    定义 + 会话摘要 + 有效历史），contextLength 为当前生效模型的上下文
+    长度；百分比以上下文长度为分母。工具定义只含内置工具，未连接的
+    MCP 工具定义无法离线估算，不计入。
+    """
+
+    estimated_tokens: int
+    context_length: int
+    available_input_tokens: int
+    categories: list[ChatContextCategoryOut] = []
+    # Agent 绑定了 MCP Server 时为 True：提示 MCP 工具定义未计入估算
+    has_mcp_tools: bool = False
+
+
 class ChatSendRequest(CamelModel):
     """发送一条用户消息并开始生成回复。"""
 
@@ -87,6 +126,10 @@ class ChatSessionOut(CamelModel):
     project_id: int | None = None
     project_role: str | None = None
     stage_index: int | None = None
+    # 会话级档位与模型覆盖（聊天输入框切换）；null = 跟随 Agent 配置
+    approval_level: str | None = None
+    autonomy_mode: str | None = None
+    model_id: int | None = None
     created_at: datetime
     updated_at: datetime
 
