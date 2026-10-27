@@ -17,7 +17,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base
@@ -30,7 +30,6 @@ MESSAGE_ROLES = (ROLE_USER, ROLE_ASSISTANT)
 STATUS_COMPLETED = "completed"
 STATUS_INCOMPLETE = "incomplete"
 MESSAGE_STATUSES = (STATUS_COMPLETED, STATUS_INCOMPLETE)
-
 
 class ChatSession(Base):
     """一次多轮对话会话。"""
@@ -50,6 +49,32 @@ class ChatSession(Base):
     summary_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 已压缩边界：seq 不大于该值的消息已被摘要覆盖，不再原文进入上下文
     summary_boundary_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # ---- 阶段化开发（阶段十五）----
+    # True 表示上一阶段已完成（模型调用了 finish_stage），等待用户验收后继续
+    awaiting_acceptance: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 上一阶段的交接摘要 JSON（stageName / summary / handoffPath / nextStep）；无则为 NULL
+    stage_summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ---- 阶段化开发 v2（阶段十六）：项目下的会话归属 ----
+    # 所属阶段项目；普通会话为 NULL
+    project_id: Mapped[int | None] = mapped_column(
+        ForeignKey("stage_projects.id"), nullable=True, index=True
+    )
+    # 会话在项目中的角色：plan（规划）/ stage（阶段）/ summary（汇总）；普通会话为 NULL
+    project_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 本会话负责的项目阶段序号（1-based）；规划与汇总会话为 NULL
+    stage_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 项目钉住的工作区目录：项目下的会话创建时继承，Runtime 以本目录优先
+    # 执行（保证多会话操作同一工作区）；普通会话为 NULL，跟随 Agent 配置
+    workspace_dir: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # ---- 会话级档位与模型覆盖（聊天输入框切换用；NULL = 跟随 Agent 配置） ----
+    # 审批档位：off / standard / strict；空为跟随 Agent
+    approval_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 自主档位：stage_confirm / autonomous；空为跟随 Agent
+    autonomy_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 本次会话使用的模型；空为跟随 Agent 绑定的模型
+    model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("model_configs.id"), nullable=True
+    )
 
     messages: Mapped[list["ChatMessage"]] = relationship(
         back_populates="session",
@@ -78,5 +103,8 @@ class ChatMessage(Base):
     # 会话内稳定顺序号，从 1 递增；读取按 (session_id, seq) 排序
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # 过程轨迹（正文段 / 思考段 / 工具卡片段交错）的 JSON；纯文字回复为 NULL。
+    # 只作展示用：刷新页面后据此恢复思考行与工具卡片，不参与模型上下文。
+    timeline_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     session: Mapped["ChatSession"] = relationship(back_populates="messages")

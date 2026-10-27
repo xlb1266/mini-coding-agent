@@ -84,6 +84,26 @@ describe('validateAgentForm', () => {
     expect(errors.compactThreshold).toBeTruthy()
     expect(errors.compactSummaryTokens).toBeTruthy()
   })
+
+  it('工作区目录允许留空与合法绝对路径', () => {
+    expect(validateAgentForm(validValues({ workspaceDir: '' })).workspaceDir).toBeUndefined()
+    expect(validateAgentForm(validValues({ workspaceDir: '  ' })).workspaceDir).toBeUndefined()
+    expect(validateAgentForm(validValues({ workspaceDir: 'D:\\projects\\demo' })).workspaceDir).toBeUndefined()
+    expect(validateAgentForm(validValues({ workspaceDir: 'D:/projects/demo' })).workspaceDir).toBeUndefined()
+    expect(validateAgentForm(validValues({ workspaceDir: '/home/user/project' })).workspaceDir).toBeUndefined()
+  })
+
+  it.each(['relative/dir', 'demo', './demo', '..\\demo'])(
+    '工作区目录「%s」必须是绝对路径',
+    (value) => {
+      expect(validateAgentForm(validValues({ workspaceDir: value })).workspaceDir).toBeTruthy()
+    },
+  )
+
+  it('工作区目录超过 512 字符时报错', () => {
+    const errors = validateAgentForm(validValues({ workspaceDir: 'D:\\' + 'x'.repeat(600) }))
+    expect(errors.workspaceDir).toBeTruthy()
+  })
 })
 
 describe('buildAgentPayload', () => {
@@ -93,6 +113,10 @@ describe('buildAgentPayload', () => {
         description: ' 润色文章 ',
         modelId: '3',
         maxRounds: '１０',
+        workspaceDir: ' D:\\projects\\demo ',
+        approvalLevel: 'strict',
+        autonomyMode: 'autonomous',
+        shellWhitelist: 'uv run pytest\ngit status',
         compactThreshold: '６０',
         compactKeepRounds: '2',
         compactSummaryTokens: '800',
@@ -108,6 +132,10 @@ describe('buildAgentPayload', () => {
       systemPrompt: '你是一个写作助手',
       modelId: 3,
       maxRounds: 10,
+      workspaceDir: 'D:\\projects\\demo',
+      approvalLevel: 'strict',
+      autonomyMode: 'autonomous',
+      shellWhitelist: 'uv run pytest\ngit status',
       autoCompact: true,
       compactThreshold: 60,
       compactKeepRounds: 2,

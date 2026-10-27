@@ -84,6 +84,7 @@ function makeTask(overrides: Partial<EvalTaskItem> = {}): EvalTaskItem {
       executingCases: 0,
       scoringCases: 0,
       averageScore: 70,
+      averageProcessScore: null,
     },
     createdAt: '2026-09-15T00:00:00+00:00',
     startedAt: null,

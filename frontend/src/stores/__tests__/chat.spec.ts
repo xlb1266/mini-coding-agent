@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createChatSession,
+  decideChatApproval,
   getChatMessages,
   listChatSessions,
   openChatEventStream,
@@ -14,7 +15,13 @@ import {
   type ChatSessionSummary,
 } from '../../api/chat'
 import { segmentsText, useChatStore } from '../chat'
-import type { GenerationSegment, RunningGeneration, ToolSegment } from '../chat'
+import type {
+  ApprovalSegment,
+  GenerationSegment,
+  ReasoningSegment,
+  RunningGeneration,
+  ToolSegment,
+} from '../chat'
 
 vi.mock('../../api/chat', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/chat')>()
@@ -27,6 +34,7 @@ vi.mock('../../api/chat', async (importOriginal) => {
     sendChatMessage: vi.fn(),
     stopChatGeneration: vi.fn(),
     openChatEventStream: vi.fn(),
+    decideChatApproval: vi.fn(),
   }
 })
 
@@ -64,6 +72,8 @@ function makeGeneration(overrides: Partial<RunningGeneration> = {}): RunningGene
     phase: 'thinking',
     agentName: '测试助手',
     toolName: null,
+    startedAt: null,
+    reasoningStartedAt: null,
     segments: [],
     ...overrides,
   }
@@ -249,6 +259,34 @@ describe('chat store 发送与流式事件', () => {
     store.upsertMessage(reply)
 
     expect(store.messagesBySession[1]).toHaveLength(1)
+  })
+
+  it('reasoning_delta 逐段合并进思考段，不拼进正文', async () => {
+    await setupActiveSession()
+    const store = useChatStore()
+    vi.mocked(sendChatMessage).mockResolvedValue({
+      session: makeSession({ isGenerating: true }),
+      userMessage: makeMessage(),
+      generation: { phase: 'thinking', content: '', agentName: '测试助手' },
+    })
+    await store.sendMessage('现在几点')
+
+    emitEvent({ type: 'reasoning_delta', runId: 'r1', seq: 1, round: 1, callId: 'mr-1', text: '用户在问时间，' })
+    emitEvent({ type: 'reasoning_delta', runId: 'r1', seq: 2, round: 1, callId: 'mr-1', text: '需要调用工具。' })
+    emitEvent({ type: 'text_delta', runId: 'r1', seq: 3, round: 1, callId: 'mr-1', text: '先查时间：' })
+    emitEvent(toolStartEvent())
+    emitEvent(toolEndEvent())
+    // 工具之后的下一轮思考单独成段，不与上一轮合并
+    emitEvent({ type: 'reasoning_delta', runId: 'r1', seq: 6, round: 2, callId: 'mr-2', text: '拿到结果了' })
+
+    const segments = store.generations[1]!.segments
+    expect(segments.map((segment) => segment.kind)).toEqual(['reasoning', 'text', 'tool', 'reasoning'])
+    expect((segments[0] as ReasoningSegment).text).toBe('用户在问时间，需要调用工具。')
+    expect((segments[3] as ReasoningSegment).text).toBe('拿到结果了')
+    // 思考不进入正文：segmentsText 只取正文段
+    expect(segmentsText(segments)).toBe('先查时间：')
+    // 第一段思考在正文到达时收起并补上耗时（本地计时）
+    expect(typeof (segments[0] as ReasoningSegment).durationMs).toBe('number')
   })
 
   it('run_end 错误态记录原因；已保存的未完成回复进入消息列表', async () => {
@@ -596,6 +634,30 @@ describe('chat store 快照恢复', () => {
     expect(store.generations[1]!.segments).toEqual([{ kind: 'text', text: '只有正文' }])
   })
 
+  it('快照时间线中的思考段恢复为思考段（含耗时），不进入正文', () => {
+    const store = useChatStore()
+    store.generations[1] = makeGeneration()
+    store.subscribeEvents(1)
+
+    emitEvent({
+      type: 'snapshot',
+      runId: 'r1',
+      phase: 'thinking',
+      content: '',
+      agentName: '测试助手',
+      toolName: null,
+      timeline: [
+        { kind: 'reasoning', text: '正在思考问题。', durationMs: 900 },
+        { kind: 'text', text: '先查时间：' },
+      ],
+    })
+
+    const segments = store.generations[1]!.segments
+    expect(segments.map((segment) => segment.kind)).toEqual(['reasoning', 'text'])
+    expect((segments[0] as ReasoningSegment).durationMs).toBe(900)
+    expect(segmentsText(segments)).toBe('先查时间：')
+  })
+
   it('旧运行的迟到事件不落入当前时间线', () => {
     const store = useChatStore()
     store.generations[1] = makeGeneration({ runId: 'run-new' })
@@ -605,6 +667,89 @@ describe('chat store 快照恢复', () => {
     emitEvent({ type: 'text_delta', runId: 'run-old', seq: 2, round: 1, callId: 'mr-1', text: '旧正文' })
 
     expect(store.generations[1]!.segments).toEqual([])
+  })
+})
+
+describe('chat store 刷新后恢复轨迹', () => {
+  it('loadMessages 用消息自带的 timeline 恢复思考行与工具卡片', async () => {
+    const session = makeSession()
+    const reply = makeMessage({
+      id: 2,
+      role: 'assistant',
+      content: '先查时间：现在是北京时间',
+      agentId: 1,
+      agentName: '测试助手',
+      seq: 2,
+      timeline: [
+        { kind: 'reasoning', text: '需要调用工具查询。', durationMs: 900 },
+        { kind: 'text', text: '先查时间：' },
+        {
+          kind: 'tool',
+          callId: 'call_1',
+          toolName: 'builtin_current_time',
+          toolType: 'builtin',
+          displayName: '当前时间',
+          serverName: null,
+          status: 'success',
+          durationMs: 5,
+          arguments: { timezone: 'Asia/Shanghai' },
+        },
+        { kind: 'text', text: '现在是北京时间' },
+      ],
+    })
+    vi.mocked(listChatSessions).mockResolvedValue([session])
+    vi.mocked(getChatMessages).mockResolvedValue({
+      session,
+      messages: [makeMessage(), reply],
+      generation: null,
+    })
+
+    const store = useChatStore()
+    await store.fetchSessions()
+    await store.selectSession(1)
+
+    const segments = store.toolTimelines[2]
+    expect(segments?.map((segment) => segment.kind)).toEqual(['reasoning', 'text', 'tool', 'text'])
+    expect((segments![0] as ReasoningSegment).durationMs).toBe(900)
+    expect(segmentsText(segments!)).toBe('先查时间：现在是北京时间')
+    // 纯文字消息不产生卡片
+    expect(store.toolTimelines[1]).toBeUndefined()
+  })
+
+  it('消息没有 timeline 时不留卡片（纯文字回复）', async () => {
+    const session = makeSession()
+    vi.mocked(listChatSessions).mockResolvedValue([session])
+    vi.mocked(getChatMessages).mockResolvedValue({
+      session,
+      messages: [makeMessage(), makeMessage({ id: 2, role: 'assistant', content: '好的', seq: 2 })],
+      generation: null,
+    })
+
+    const store = useChatStore()
+    await store.fetchSessions()
+    await store.selectSession(1)
+
+    expect(store.toolTimelines).toEqual({})
+  })
+
+  it('本地已有实时时间线时不覆盖（同一次运行内的内存轨迹更完整）', () => {
+    const store = useChatStore()
+    const live = makeGeneration({
+      segments: [{ kind: 'text', text: '内存里的正文' }],
+    })
+    store.toolTimelines[2] = live.segments
+
+    store.seedTimelines([
+      makeMessage({
+        id: 2,
+        role: 'assistant',
+        content: '库里的正文',
+        seq: 2,
+        timeline: [{ kind: 'text', text: '库里的正文' }],
+      }),
+    ])
+
+    expect(segmentsText(store.toolTimelines[2]!)).toBe('内存里的正文')
   })
 })
 
@@ -826,5 +971,177 @@ describe('chat store 上下文压缩', () => {
     expect(store.orphanSegments[1]).toHaveLength(1)
     const compact = store.orphanSegments[1]![0] as Extract<GenerationSegment, { kind: 'compact' }>
     expect(compact.compact.status).toBe('cancelled')
+  })
+})
+
+describe('chat store 工具执行审批（模块二）', () => {
+  function approvalRequestEvent(overrides: Record<string, unknown> = {}): ChatEvent {
+    return {
+      type: 'approval_request',
+      runId: 'r1',
+      seq: 5,
+      round: 1,
+      requestId: 'apr-1',
+      callId: 'call_1',
+      toolName: 'builtin_shell',
+      toolType: 'builtin',
+      displayName: 'Shell 命令',
+      serverName: null,
+      arguments: { command: 'echo hi' },
+      ...overrides,
+    } as ChatEvent
+  }
+
+  function approvalResultEvent(overrides: Record<string, unknown> = {}): ChatEvent {
+    return {
+      type: 'approval_result',
+      runId: 'r1',
+      seq: 6,
+      round: 1,
+      requestId: 'apr-1',
+      callId: 'call_1',
+      toolName: 'builtin_shell',
+      toolType: 'builtin',
+      decision: 'approved',
+      ...overrides,
+    } as ChatEvent
+  }
+
+  function approvalSegments(generation: RunningGeneration | undefined): ApprovalSegment[] {
+    return (generation?.segments ?? []).filter(
+      (segment): segment is ApprovalSegment => segment.kind === 'approval',
+    )
+  }
+
+  async function setupActive(): Promise<void> {
+    const session = makeSession()
+    vi.mocked(listChatSessions).mockResolvedValue([session])
+    vi.mocked(getChatMessages).mockResolvedValue({ session, messages: [], generation: null })
+    const store = useChatStore()
+    await store.fetchSessions()
+    await store.selectSession(1)
+    store.generations[1] = makeGeneration()
+    store.subscribeEvents(1)
+  }
+
+  it('approval_request 建卡进入 approval 阶段；approval_result 原地更新终态', async () => {
+    await setupActive()
+    const store = useChatStore()
+
+    emitEvent({ type: 'text_delta', runId: 'r1', seq: 2, round: 1, callId: 'mr-1', text: '我来执行' })
+    emitEvent(approvalRequestEvent())
+
+    const generation = store.generations[1]!
+    expect(generation.phase).toBe('approval')
+    const approval = approvalSegments(generation)[0]!.approval
+    expect(approval.status).toBe('pending')
+    expect(approval.toolName).toBe('builtin_shell')
+    expect(approval.arguments).toEqual({ command: 'echo hi' })
+
+    emitEvent(approvalResultEvent())
+    expect(generation.phase).toBe('generating')
+    expect(approval.status).toBe('approved')
+    expect(approval.deciding).toBe(false)
+  })
+
+  it('decideApproval 调用后端决议并在等待期间置灰；失败显示错误', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent(approvalRequestEvent())
+    const approval = approvalSegments(store.generations[1]!)[0]!.approval
+
+    // 正常决议
+    vi.mocked(decideChatApproval).mockResolvedValueOnce({
+      requestId: 'apr-1',
+      action: 'approve',
+      outcome: 'approved',
+    })
+    const deciding = store.decideApproval(1, 'apr-1', true)
+    expect(approval.deciding).toBe(true)
+    await deciding
+    expect(decideChatApproval).toHaveBeenCalledWith(1, 'apr-1', 'approve')
+    expect(approval.error).toBeNull()
+
+    // 决议失败（如审批已被处理）：按钮恢复可点，错误显示在卡片
+    vi.mocked(decideChatApproval).mockRejectedValueOnce(new Error('审批请求不存在或已被处理'))
+    emitEvent(approvalRequestEvent({ requestId: 'apr-2', seq: 7 }))
+    await store.decideApproval(1, 'apr-2', false)
+    const second = approvalSegments(store.generations[1]!).find((s) => s.approval.requestId === 'apr-2')!
+      .approval
+    expect(second.deciding).toBe(false)
+    expect(second.error).toBe('审批请求不存在或已被处理')
+  })
+
+  it('已决定或正在提交的审批不重复提交', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent(approvalRequestEvent())
+    emitEvent(approvalResultEvent())
+
+    await store.decideApproval(1, 'apr-1', true)
+    expect(decideChatApproval).not.toHaveBeenCalled()
+  })
+
+  it('run_end 取消时未决议的审批标记为已取消', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent(approvalRequestEvent())
+    emitEvent({
+      type: 'run_end',
+      runId: 'r1',
+      seq: 99,
+      status: 'cancelled',
+      reason: 'cancelled',
+      roundsUsed: 1,
+      content: '',
+      message: null,
+      error: null,
+    })
+
+    expect(store.orphanSegments[1]).toHaveLength(1)
+    const approval = store.orphanSegments[1]![0] as Extract<GenerationSegment, { kind: 'approval' }>
+    expect(approval.approval.status).toBe('cancelled')
+  })
+
+  it('快照时间线恢复审批卡片（刷新后仍在等待的审批继续展示）', async () => {
+    await setupActive()
+    const store = useChatStore()
+    emitEvent({
+      type: 'snapshot',
+      runId: 'r1',
+      phase: 'approval',
+      content: '',
+      agentName: '测试助手',
+      toolName: null,
+      pendingApprovals: [
+        {
+          requestId: 'apr-1',
+          callId: 'call_1',
+          toolName: 'builtin_shell',
+          toolType: 'builtin',
+          displayName: 'Shell 命令',
+          arguments: { command: 'echo hi' },
+        },
+      ],
+      timeline: [
+        { kind: 'text', text: '准备执行命令' },
+        {
+          kind: 'approval',
+          requestId: 'apr-1',
+          callId: 'call_1',
+          toolName: 'builtin_shell',
+          toolType: 'builtin',
+          displayName: 'Shell 命令',
+          arguments: { command: 'echo hi' },
+          status: 'pending',
+        },
+      ],
+    })
+
+    const generation = store.generations[1]!
+    expect(generation.phase).toBe('approval')
+    const approval = approvalSegments(generation)[0]!.approval
+    expect(approval.status).toBe('pending')
+    expect(approval.displayName).toBe('Shell 命令')
   })
 })

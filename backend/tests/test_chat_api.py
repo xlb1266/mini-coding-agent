@@ -14,7 +14,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.services import model_client
-from app.services.chat_generation import generation_manager, make_session_title
+from datetime import datetime
+
+from app.db.models.chat import ChatMessage
+from app.services.chat_generation import (
+    generation_manager,
+    make_session_title,
+    message_event_payload,
+    message_to_out,
+)
 
 API_KEY = "sk-test-123456"
 
@@ -52,6 +60,8 @@ def create_agent(client: TestClient, model_id: int, **overrides: object) -> dict
         "toolKeys": [],
         "skillDirNames": [],
         "mcpServerIds": [],
+        # 测试默认高度自主：不带阶段协议提示词，便于断言纯系统提示词
+        "autonomyMode": "autonomous",
     }
     payload.update(overrides)
     response = client.post("/api/agents", json=payload)
@@ -90,6 +100,10 @@ def sse_chunk(payload: dict) -> bytes:
 
 def delta_chunk(text: str) -> bytes:
     return sse_chunk({"choices": [{"delta": {"content": text}}]})
+
+
+def reasoning_chunk(text: str) -> bytes:
+    return sse_chunk({"choices": [{"delta": {"reasoning_content": text}}]})
 
 
 DONE_CHUNK = b"data: [DONE]\n\n"
@@ -1061,6 +1075,120 @@ class TestRuntimeToolLoop:
         assert events[-1]["status"] == "completed"
         assert events[-1]["message"]["content"] == "先查时间：现在是北京时间，吃了吗"
 
+    def test_reasoning_timeline_and_saved_content(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, seeded_tools
+    ) -> None:
+        """思考增量进入展示时间线（思考卡片可恢复），但保存的回复正文不包含思考。"""
+        model = create_model(client)
+        agent = create_agent(client, model["id"], toolKeys=["builtin_current_time"])
+        session = create_session(client, agent_id=agent["id"])
+        transport = MultiResponseTransport(
+            [
+                [
+                    reasoning_chunk("用户在问时间，"),
+                    reasoning_chunk("需要调用工具查询。"),
+                    delta_chunk("先查时间："),
+                    tool_call_chunk("call_1", "builtin_current_time", '{"timezone": "Asia/Shanghai"}'),
+                    finish_chunk("tool_calls"),
+                    DONE_CHUNK,
+                ],
+                [reasoning_chunk("拿到结果，组织回答。"), delta_chunk("现在是北京时间"), DONE_CHUNK],
+            ],
+            delay=0.05,
+        )
+
+        def factory(timeout: float) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=transport, timeout=timeout)
+
+        monkeypatch.setattr(model_client, "_create_async_client", factory)
+
+        assert send_message(client, session["id"], "现在几点").status_code == 201
+        # 等工具卡片进入时间线后再订阅：快照应带回思考段及其顺序
+        wait_for(
+            client,
+            session["id"],
+            lambda data: any(
+                item.get("kind") == "tool" for item in (data.get("generation") or {}).get("timeline", [])
+            ),
+            what="时间线出现工具卡片",
+        )
+        events = collect_events(client, session["id"])
+
+        snapshot = events[0]
+        assert snapshot["type"] == "snapshot"
+        kinds = [item["kind"] for item in snapshot["timeline"]]
+        assert kinds[:3] == ["reasoning", "text", "tool"]
+        assert all(kind in ("reasoning", "text", "tool") for kind in kinds)
+        reasoning_item = snapshot["timeline"][0]
+        # 相邻思考增量合并为一段；工具开始时收起并补上耗时
+        assert reasoning_item["text"] == "用户在问时间，需要调用工具查询。"
+        assert isinstance(reasoning_item.get("durationMs"), int)
+        # 订阅后继续实时收到第二轮的思考增量
+        assert any(e["type"] == "reasoning_delta" and "拿到结果" in e["text"] for e in events)
+
+        data = wait_generation_done(client, session["id"])
+        # 思考内容只做展示，不进入保存的回复正文
+        assert data["messages"][1]["content"] == "先查时间：现在是北京时间"
+        assert events[-1]["type"] == "run_end"
+        assert events[-1]["status"] == "completed"
+
+    def test_saved_message_keeps_timeline_for_refresh(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, seeded_tools
+    ) -> None:
+        """轨迹随回复入库：刷新页面后重新拉 /messages 仍能拿到思考段与工具卡片。"""
+        model = create_model(client)
+        agent = create_agent(client, model["id"], toolKeys=["builtin_current_time"])
+        session = create_session(client, agent_id=agent["id"])
+        transport = MultiResponseTransport(
+            [
+                [
+                    reasoning_chunk("用户在问时间，"),
+                    reasoning_chunk("需要调用工具查询。"),
+                    delta_chunk("先查时间："),
+                    tool_call_chunk("call_1", "builtin_current_time", '{"timezone": "Asia/Shanghai"}'),
+                    finish_chunk("tool_calls"),
+                    DONE_CHUNK,
+                ],
+                [reasoning_chunk("拿到结果，组织回答。"), delta_chunk("现在是北京时间"), DONE_CHUNK],
+            ],
+            delay=0.02,
+        )
+
+        def factory(timeout: float) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=transport, timeout=timeout)
+
+        monkeypatch.setattr(model_client, "_create_async_client", factory)
+
+        assert send_message(client, session["id"], "现在几点").status_code == 201
+        data = wait_generation_done(client, session["id"])
+
+        # 已结束的运行不再有内存时间线，轨迹只能来自入库的消息
+        assert (data.get("generation") or None) is None
+        reply = data["messages"][1]
+        timeline = reply["timeline"]
+        assert [item["kind"] for item in timeline] == ["reasoning", "text", "tool", "reasoning", "text"]
+        assert timeline[0]["text"] == "用户在问时间，需要调用工具查询。"
+        assert isinstance(timeline[0]["durationMs"], int)
+        tool_item = timeline[2]
+        assert tool_item["callId"] == "call_1"
+        assert tool_item["displayName"] == "当前时间"
+        assert tool_item["status"] == "success"
+        assert tool_item["arguments"] == {"timezone": "Asia/Shanghai"}
+
+    def test_message_without_trace_has_no_timeline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """纯文字回复不写入轨迹（timeline 为 null），不影响原有读取。"""
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+        install_stream(monkeypatch, StreamTransport(chunks=[delta_chunk("好的"), DONE_CHUNK]))
+
+        assert send_message(client, session["id"], "你好").status_code == 201
+        data = wait_generation_done(client, session["id"])
+
+        assert data["messages"][1]["timeline"] is None
+        assert data["messages"][0]["timeline"] is None
+
 
 class TestContextCompaction:
     """阶段十：会话摘要过滤、发送前容量校验与压缩结果持久化。"""
@@ -1183,3 +1311,223 @@ class TestContextCompaction:
         assert any(c.startswith("第5条消息") for c in contents)
         assert "最后一问" in contents
         assert not any(c.startswith("第1条消息") for c in contents)
+
+
+class TestMessagePayload:
+    """消息输出模型：轨迹随消息返回，但终态事件里不带轨迹。"""
+
+    def _message(self, timeline_json: str | None) -> ChatMessage:
+        message = ChatMessage(
+            session_id=1,
+            role="assistant",
+            content="先查时间：现在是北京时间",
+            agent_id=1,
+            agent_name="测试助手",
+            status="completed",
+            seq=2,
+            created_at=datetime(2026, 9, 24, 10, 0, 0),
+            timeline_json=timeline_json,
+        )
+        message.id = 7
+        return message
+
+    def test_message_out_parses_stored_timeline(self) -> None:
+        timeline = [
+            {"kind": "reasoning", "text": "先想一下", "durationMs": 900},
+            {"kind": "text", "text": "先查时间："},
+            {"kind": "tool", "callId": "call_1", "status": "success"},
+        ]
+        out = message_to_out(self._message(json.dumps(timeline, ensure_ascii=False)))
+
+        assert out.timeline == timeline
+
+    def test_broken_or_missing_timeline_falls_back_to_none(self) -> None:
+        assert message_to_out(self._message(None)).timeline is None
+        assert message_to_out(self._message("{不是合法 JSON")).timeline is None
+        assert message_to_out(self._message("[]")).timeline is None
+
+    def test_event_payload_omits_timeline(self) -> None:
+        message = self._message(json.dumps([{"kind": "tool", "callId": "call_1"}]))
+
+        payload = message_event_payload(message)
+
+        assert "timeline" not in payload
+        assert payload["content"] == "先查时间：现在是北京时间"
+        assert payload["sessionId"] == 1
+
+
+# ---- 会话级档位与模型覆盖（聊天输入框切换） ----
+
+
+class TestSessionModeAndModel:
+    def test_switch_mode_persists_on_session(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.put(
+            f"/api/chat/sessions/{session['id']}/mode",
+            json={"approvalLevel": "standard", "autonomyMode": "stage_confirm"},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["approvalLevel"] == "standard"
+        assert body["autonomyMode"] == "stage_confirm"
+        # 其他会话不受影响（会话级覆盖）
+        other = create_session(client, agent_id=agent["id"])
+        assert other["approvalLevel"] is None
+        assert other["autonomyMode"] is None
+
+    def test_switch_mode_rejects_invalid_values(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.put(
+            f"/api/chat/sessions/{session['id']}/mode",
+            json={"approvalLevel": "yolo", "autonomyMode": "stage_confirm"},
+        )
+
+        assert response.status_code == 422
+
+    def test_switch_model_persists_on_session(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        other_model = create_model(client, displayName="备用模型", modelIdentifier="backup-1")
+        session = create_session(client, agent_id=agent["id"])
+        assert session["modelId"] is None
+
+        response = client.put(
+            f"/api/chat/sessions/{session['id']}/model", json={"modelId": other_model["id"]}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["modelId"] == other_model["id"]
+
+    def test_switch_model_rejects_unknown_model(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.put(f"/api/chat/sessions/{session['id']}/model", json={"modelId": 9999})
+
+        assert response.status_code == 422
+
+    def test_mode_and_model_blocked_while_generating(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+        # 直接占住生成状态：路由只检查 is_generating，无需真实运行
+        from app.services.chat_generation import GenerationRun, generation_manager
+
+        generation_manager._runs[session["id"]] = GenerationRun(
+            session_id=session["id"],
+            agent_id=agent["id"],
+            agent_name="x",
+            user_input="x",
+            history=[],
+            api_key=None,
+            session_factory=None,
+            secret_box=None,
+            skills_dir=None,
+        )
+        try:
+            mode = client.put(
+                f"/api/chat/sessions/{session['id']}/mode",
+                json={"approvalLevel": "off", "autonomyMode": "autonomous"},
+            )
+            model = client.put(
+                f"/api/chat/sessions/{session['id']}/model", json={"modelId": 1}
+            )
+        finally:
+            generation_manager._runs.clear()
+
+        assert mode.status_code == 409
+        assert model.status_code == 409
+
+    def test_session_overrides_reach_model_request(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """会话级覆盖端到端生效：换模型 + 开阶段确认后，请求打到新模型、
+        系统提示词带阶段协议（Agent 本身是高度自主 + 首个模型）。"""
+        agent = seed_default_agent(client, autonomyMode="autonomous")
+        second_model = create_model(
+            client,
+            displayName="第二模型",
+            modelIdentifier="second-1",
+            baseUrl="https://second.example.com/v1",
+        )
+        session = create_session(client, agent_id=agent["id"])
+        assert (
+            client.put(
+                f"/api/chat/sessions/{session['id']}/mode",
+                json={"approvalLevel": "off", "autonomyMode": "stage_confirm"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.put(
+                f"/api/chat/sessions/{session['id']}/model", json={"modelId": second_model["id"]}
+            ).status_code
+            == 200
+        )
+        capture: list[dict] = []
+        install_stream(
+            monkeypatch,
+            StreamTransport(chunks=[delta_chunk("好的"), DONE_CHUNK], capture=capture),
+        )
+
+        assert send_message(client, session["id"], "你好").status_code == 201
+        wait_generation_done(client, session["id"])
+
+        assert len(capture) == 1
+        assert capture[0]["url"] == "https://second.example.com/v1/chat/completions"
+        system = capture[0]["body"]["messages"][0]
+        assert system["role"] == "system"
+        assert "阶段化开发工作流" in system["content"]
+        assert "## 可用 Skills" not in system["content"]
+
+
+# ---- 上下文占用量（估算口径） ----
+
+
+class TestContextUsage:
+    def test_usage_shape_and_categories(self, client: TestClient) -> None:
+        agent = seed_default_agent(client, autonomyMode="stage_confirm")
+        session = create_session(client, agent_id=agent["id"])
+
+        response = client.get(f"/api/chat/sessions/{session['id']}/context-usage")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["contextLength"] == 32768
+        assert body["estimatedTokens"] > 0
+        assert body["availableInputTokens"] > 0
+        assert body["availableInputTokens"] < body["contextLength"]
+        keys = [c["key"] for c in body["categories"]]
+        assert keys == ["systemPrompt", "skills", "tools", "summary", "messages"]
+        by_key = {c["key"]: c for c in body["categories"]}
+        # 阶段确认模式的系统提示词包含阶段协议，应明显非零
+        assert by_key["systemPrompt"]["tokens"] > 0
+        assert by_key["messages"]["tokens"] == 0
+        assert all(c["percent"] >= 0 for c in body["categories"])
+
+    def test_usage_reflects_session_model(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        big_model = create_model(client, contextLength=131072, displayName="大杯", modelIdentifier="big-1")
+        session = create_session(client, agent_id=agent["id"])
+
+        default_usage = client.get(f"/api/chat/sessions/{session['id']}/context-usage").json()
+        assert default_usage["contextLength"] == 32768
+        client.put(f"/api/chat/sessions/{session['id']}/model", json={"modelId": big_model["id"]})
+        overridden = client.get(f"/api/chat/sessions/{session['id']}/context-usage").json()
+
+        assert overridden["contextLength"] == 131072
+
+    def test_usage_without_agent_is_conflict(self, client: TestClient) -> None:
+        agent = seed_default_agent(client)
+        session = create_session(client, agent_id=agent["id"])
+        assert client.delete(f"/api/agents/{agent['id']}").status_code in (200, 204)
+
+        response = client.get(f"/api/chat/sessions/{session['id']}/context-usage")
+
+        assert response.status_code == 409
+
+    def test_usage_missing_session_is_404(self, client: TestClient) -> None:
+        assert client.get("/api/chat/sessions/999/context-usage").status_code == 404

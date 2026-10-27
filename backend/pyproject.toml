@@ -5,7 +5,7 @@ description = "mini-coding-agent 后端服务（FastAPI + SQLAlchemy + Alembic +
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.19.2",
-    "fastapi>=0.141.1",
+    "fastapi[standard]>=0.141.1",
     "httpx>=0.28.1",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
@@ -23,3 +23,6 @@ testpaths = ["tests"]
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.fastapi]
+entrypoint = "app.main:app"

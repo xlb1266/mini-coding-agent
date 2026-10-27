@@ -1,24 +1,35 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import PageHeader from '../components/PageHeader.vue'
+import ApprovalCard from '../components/ApprovalCard.vue'
+import ChatComposer from '../components/ChatComposer.vue'
 import CompactionCard from '../components/CompactionCard.vue'
 import MarkdownContent from '../components/MarkdownContent.vue'
-import ToolCallCard from '../components/ToolCallCard.vue'
+import ProjectStagesCard from '../components/ProjectStagesCard.vue'
+import ThinkingCard from '../components/ThinkingCard.vue'
+import ToolGroupCard from '../components/ToolGroupCard.vue'
+import type { ContextUsage, ModePreset } from '../api/chat'
+import { getChatContextUsage, matchModePreset } from '../api/chat'
 import { useAgentsStore } from '../stores/agents'
 import { segmentsText, useChatStore } from '../stores/chat'
+import { useModelsStore } from '../stores/models'
 import type { GenerationSegment } from '../stores/chat'
+import { buildDisplayItems } from './chat-format'
+import type { ChatDisplayItem } from './chat-format'
 import type { ChatMessage } from '../api/chat'
 
 const agentsStore = useAgentsStore()
 const chatStore = useChatStore()
+const modelsStore = useModelsStore()
 const router = useRouter()
 
-const draft = ref('')
 const actionError = ref('')
 const creatingSession = ref(false)
 const stopPending = ref(false)
+
+const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null)
 
 // Agent 选择框的本地值：切换会话时同步，后端确认失败时回滚
 const agentSelect = ref<number | ''>('')
@@ -43,9 +54,60 @@ const canSend = computed(
     hasAgents.value &&
     session.value !== null &&
     session.value.agentId !== null &&
-    !isGenerating.value &&
-    draft.value.trim().length > 0,
+    !isGenerating.value,
 )
+
+// ---- 会话级档位与模型（输入框切换，null 跟随 Agent 配置） ----
+
+const activeAgent = computed(() =>
+  session.value?.agentId != null
+    ? agentsStore.agents.find((agent) => agent.id === session.value!.agentId) ?? null
+    : null,
+)
+
+const effectiveApproval = computed(
+  () => session.value?.approvalLevel ?? activeAgent.value?.approvalLevel ?? null,
+)
+
+const effectiveAutonomy = computed(
+  () => session.value?.autonomyMode ?? activeAgent.value?.autonomyMode ?? null,
+)
+
+/** 当前生效档位组合对应的菜单预设；组合不匹配三项预设时为 null（显示"自定义档位"）。 */
+const activePreset = computed(() => matchModePreset(effectiveApproval.value, effectiveAutonomy.value))
+
+const effectiveModelId = computed(
+  () => session.value?.modelId ?? activeAgent.value?.model?.id ?? null,
+)
+
+const modelReady = computed(() => {
+  if (effectiveModelId.value === null) return false
+  return modelsStore.models.some((model) => model.id === effectiveModelId.value)
+})
+
+const modelLabel = computed(() => {
+  const model = modelsStore.models.find((item) => item.id === effectiveModelId.value)
+  return model?.displayName ?? '模型缺失'
+})
+
+// ---- 上下文占用量（估算口径）：切会话、回复结束、切档位/模型后刷新 ----
+
+const usage = ref<ContextUsage | null>(null)
+
+async function fetchUsage(): Promise<void> {
+  const sessionId = session.value?.id
+  if (sessionId === undefined || session.value?.agentId == null) {
+    usage.value = null
+    return
+  }
+  try {
+    const next = await getChatContextUsage(sessionId)
+    // 请求期间切走了会话：丢弃过期结果
+    if (session.value?.id === sessionId) usage.value = next
+  } catch {
+    if (session.value?.id === sessionId) usage.value = null
+  }
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '操作失败，请重试'
@@ -56,6 +118,8 @@ function errorMessage(error: unknown): string {
 onMounted(async () => {
   await agentsStore.fetchAgents().catch(() => undefined)
   await chatStore.fetchSessions().catch(() => undefined)
+  // 每次进入聊天页都刷新模型列表：模型管理页的增删要及时反映到切换菜单
+  await modelsStore.fetchModels().catch(() => undefined)
   if (chatStore.activeSessionId === null && chatStore.sessions.length > 0) {
     await chatStore.selectSession(chatStore.sessions[0]!.id).catch(() => undefined)
   }
@@ -64,9 +128,10 @@ onMounted(async () => {
 watch(
   () => session.value?.id,
   () => {
-    draft.value = ''
     actionError.value = ''
+    void fetchUsage()
   },
+  { immediate: true },
 )
 
 watch(
@@ -76,6 +141,11 @@ watch(
   },
   { immediate: true },
 )
+
+// 回复结束后上下文已变化：刷新占用量
+watch(isGenerating, (generating, previous) => {
+  if (previous && !generating) void fetchUsage()
+})
 
 async function handleSelectSession(sessionId: number): Promise<void> {
   actionError.value = ''
@@ -111,26 +181,92 @@ async function handleAgentChange(): Promise<void> {
 
 // ---- 发送与停止 ----
 
-function handleKeydown(event: KeyboardEvent): void {
-  if (event.key !== 'Enter' || event.shiftKey) return
-  // 中文输入法选词/组字状态的回车不触发发送
-  if (event.isComposing || event.keyCode === 229) return
-  event.preventDefault()
-  void handleSend()
-}
-
-async function handleSend(): Promise<void> {
+async function handleSend(content: string): Promise<void> {
   if (!canSend.value || !session.value) return
-  const content = draft.value
   actionError.value = ''
   try {
     await chatStore.sendMessage(content)
     // 保存成功才清空输入框；失败时保留内容便于修改重发
-    draft.value = ''
+    composerRef.value?.clearDraft()
   } catch (error) {
     actionError.value = errorMessage(error)
   }
 }
+
+/** 切换执行档位（会话级覆盖）：成功后同步会话并刷新上下文用量。 */
+async function handleChangeMode(preset: ModePreset): Promise<void> {
+  if (!session.value) return
+  actionError.value = ''
+  try {
+    await chatStore.changeMode(session.value.id, preset.approvalLevel, preset.autonomyMode)
+    void fetchUsage()
+  } catch (error) {
+    actionError.value = errorMessage(error)
+  }
+}
+
+/** 切换会话模型（会话级覆盖）：成功后刷新上下文用量（上下文长度随模型变化）。 */
+async function handleChangeModel(modelId: number): Promise<void> {
+  if (!session.value) return
+  actionError.value = ''
+  try {
+    await chatStore.changeModel(session.value.id, modelId)
+    void fetchUsage()
+  } catch (error) {
+    actionError.value = errorMessage(error)
+  }
+}
+
+// ---- 阶段项目（阶段化开发 v2）----
+
+/** 当前会话所属的阶段项目（项目会话才拉取）。 */
+const project = computed(() => {
+  const projectId = session.value?.projectId
+  return projectId ? chatStore.stageProjects[projectId] ?? null : null
+})
+
+const projectBusy = ref(false)
+
+// 切换会话就刷新项目卡：同一项目内切换阶段会话时 projectId 不变，
+// 只 watch projectId 会漏掉阶段收尾后的状态推进
+watch(
+  () => [session.value?.id, session.value?.projectId] as const,
+  ([, projectId]) => {
+    if (projectId) void chatStore.fetchStageProject(projectId)
+  },
+  { immediate: true },
+)
+
+// 生成结束（阶段收尾 / 计划上报会推进项目状态）后刷新项目卡
+watch(isGenerating, (generating, previous) => {
+  const projectId = session.value?.projectId
+  if (previous && !generating && projectId) void chatStore.fetchStageProject(projectId)
+})
+
+/** 项目推进（开始 / 下一阶段 / 汇总）：后端自动新建会话并切换过去。 */
+async function runProjectAction(action: 'start' | 'next' | 'summary'): Promise<void> {
+  const projectId = session.value?.projectId
+  if (!projectId || projectBusy.value) return
+  projectBusy.value = true
+  actionError.value = ''
+  try {
+    if (action === 'start') {
+      await chatStore.startStageProject(projectId)
+    } else if (action === 'next') {
+      await chatStore.nextStageProject(projectId)
+    } else {
+      await chatStore.summarizeStageProject(projectId)
+    }
+  } catch (error) {
+    actionError.value = errorMessage(error)
+  } finally {
+    projectBusy.value = false
+  }
+}
+
+// ---- 阶段完成提示 ----
+// 不再做单独的悬浮横幅：阶段成果概述在模型回复正文里，
+// 交接文档全文在 finish_stage 工具卡展开区；推进按钮在上方项目卡里。
 
 async function handleStop(): Promise<void> {
   if (!session.value || stopPending.value) return
@@ -209,17 +345,71 @@ function timelineFor(message: ChatMessage): GenerationSegment[] | null {
   return chatStore.toolTimelines[message.id] ?? null
 }
 
-const orphanSegments = computed(() =>
-  session.value ? chatStore.orphanSegments[session.value.id] ?? [] : [],
+/** 已结束回复的展示项：连续工具合并成“使用N个工具”组，默认全部收起。 */
+function timelineItems(message: ChatMessage): ChatDisplayItem[] {
+  return buildDisplayItems(timelineFor(message) ?? [])
+}
+
+const orphanItems = computed(() =>
+  buildDisplayItems(session.value ? chatStore.orphanSegments[session.value.id] ?? [] : []),
 )
+
+const generationItems = computed(() => buildDisplayItems(generation.value?.segments ?? []))
+
+/** 末项是思考项：思考仍在流式生成，由思考行自己表达“思考中”。 */
+const reasoningStreaming = computed(() => {
+  const items = generationItems.value
+  const last = items[items.length - 1]
+  return last !== undefined && last.kind === 'reasoning'
+})
+
+// ---- 运行计时（“处理中 1m 52s”） ----
+
+const nowMs = ref(Date.now())
+let clockTimer: number | undefined
+
+onMounted(() => {
+  clockTimer = window.setInterval(() => {
+    nowMs.value = Date.now()
+  }, 1000)
+})
+
+onUnmounted(() => {
+  if (clockTimer !== undefined) window.clearInterval(clockTimer)
+})
+
+/** 运行耗时文本：秒级用“12s”，分钟级用“1m 52s”，小时级用“1h 5m”。 */
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  if (minutes < 60) return `${minutes}m ${totalSeconds % 60}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+const elapsedText = computed(() => {
+  const startedAt = generation.value?.startedAt
+  if (startedAt === undefined || startedAt === null) return ''
+  return formatElapsed(nowMs.value - startedAt)
+})
+
+/** 运行状态行文本：“处理中 1m 52s”。 */
+const runStatusText = computed(() => (elapsedText.value ? `处理中 ${elapsedText.value}` : '处理中'))
 
 const phaseLabel = computed(() => {
   const phase = generation.value?.phase
   if (phase === 'tooling') return '调用工具'
   if (phase === 'generating') return '生成'
   if (phase === 'compacting') return '压缩上下文'
+  if (phase === 'approval') return '等待审批'
   return '思考'
 })
+
+/** 对一次审批做出决议；结果由 approval_result 事件更新到卡片上。 */
+function handleDecide(requestId: string, approved: boolean): void {
+  if (!session.value) return
+  void chatStore.decideApproval(session.value.id, requestId, approved)
+}
 
 function formatMessageTime(iso: string): string {
   const date = new Date(iso)
@@ -317,6 +507,20 @@ function formatSessionTime(iso: string): string {
             <span v-else-if="agentMissing" class="agent-missing">当前会话未选择 Agent，发送前请先选择</span>
           </header>
 
+          <!-- 阶段项目清单卡（阶段化开发 v2）：项目会话常显，推进按钮按状态出现 -->
+          <div v-if="project" class="project-strip">
+            <ProjectStagesCard
+              :project="project"
+              :session-role="session.projectRole ?? null"
+              :awaiting-acceptance="!!session.awaitingAcceptance"
+              :busy="projectBusy || isGenerating"
+              @start="runProjectAction('start')"
+              @next="runProjectAction('next')"
+              @summary="runProjectAction('summary')"
+              @open-session="handleSelectSession"
+            />
+          </div>
+
           <div ref="messagesEl" class="messages" @scroll="handleScroll">
             <p v-if="messages.length === 0" class="messages-empty">输入消息开始对话，回复会实时显示在这里。</p>
 
@@ -331,12 +535,22 @@ function formatSessionTime(iso: string): string {
                   <span class="bubble-agent">{{ message.agentName ?? 'Agent' }}</span>
                   <span v-if="message.status === 'incomplete'" class="bubble-status">未完成</span>
                 </div>
-                <!-- 带时间线的回复：正文、工具卡片与压缩卡片按事件顺序交错展示 -->
+                <!-- 带时间线的回复：正文、思考行与工具组按事件顺序交错展示 -->
                 <template v-if="message.role === 'assistant' && timelineFor(message)">
-                  <template v-for="(segment, index) in timelineFor(message)" :key="index">
-                    <MarkdownContent v-if="segment.kind === 'text'" :text="segment.text" />
-                    <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
-                    <CompactionCard v-else :compact="segment.compact" />
+                  <template v-for="item in timelineItems(message)" :key="item.key">
+                    <MarkdownContent v-if="item.kind === 'text'" :text="item.text" />
+                    <ThinkingCard v-else-if="item.kind === 'reasoning'" :reasoning="item.reasoning" />
+                    <ToolGroupCard
+                      v-else-if="item.kind === 'toolGroup'"
+                      :tools="item.tools"
+                      @toggle="handleCardToggle"
+                    />
+                    <ApprovalCard
+                      v-else-if="item.kind === 'approval'"
+                      :approval="item.approval"
+                      @decide="(approved) => handleDecide(item.approval.requestId, approved)"
+                    />
+                    <CompactionCard v-else :compact="item.compact" />
                   </template>
                 </template>
                 <MarkdownContent v-else-if="message.role === 'assistant'" :text="message.content" />
@@ -345,16 +559,22 @@ function formatSessionTime(iso: string): string {
               </div>
             </div>
 
-            <!-- 无保存消息的收尾运行（取消且无正文等）留下的工具/压缩卡片 -->
-            <div v-if="orphanSegments.length" class="message-row is-assistant">
+            <!-- 无保存消息的收尾运行（取消且无正文等）留下的思考/工具卡片 -->
+            <div v-if="orphanItems.length" class="message-row is-assistant">
               <div class="tool-orphan">
-                <template v-for="(segment, index) in orphanSegments" :key="index">
-                  <ToolCallCard
-                    v-if="segment.kind === 'tool'"
-                    :tool="segment.tool"
+                <template v-for="item in orphanItems" :key="item.key">
+                  <ThinkingCard v-if="item.kind === 'reasoning'" :reasoning="item.reasoning" />
+                  <ToolGroupCard
+                    v-else-if="item.kind === 'toolGroup'"
+                    :tools="item.tools"
                     @toggle="handleCardToggle"
                   />
-                  <CompactionCard v-else-if="segment.kind === 'compact'" :compact="segment.compact" />
+                  <ApprovalCard
+                    v-else-if="item.kind === 'approval'"
+                    :approval="item.approval"
+                    @decide="(approved) => handleDecide(item.approval.requestId, approved)"
+                  />
+                  <CompactionCard v-else-if="item.kind === 'compact'" :compact="item.compact" />
                 </template>
               </div>
             </div>
@@ -363,18 +583,39 @@ function formatSessionTime(iso: string): string {
             <div v-if="generation" class="message-row is-assistant">
               <div class="message-bubble is-assistant is-streaming">
                 <div class="bubble-head">
+                  <span class="run-status">
+                    <span class="run-mark" aria-hidden="true">✦</span>{{ runStatusText }}
+                  </span>
                   <span class="bubble-agent">{{ generation.agentName }}</span>
                 </div>
-                <template v-for="(segment, index) in generation.segments" :key="index">
+                <template v-for="item in generationItems" :key="item.key">
                   <MarkdownContent
-                    v-if="segment.kind === 'text'"
-                    :text="segment.text"
-                    :cursor="generation.phase === 'generating' && index === generation.segments.length - 1"
+                    v-if="item.kind === 'text'"
+                    :text="item.text"
+                    :cursor="generation.phase === 'generating' && item.key === generationItems[generationItems.length - 1]?.key"
                   />
-                  <ToolCallCard v-else-if="segment.kind === 'tool'" :tool="segment.tool" @toggle="handleCardToggle" />
-                  <CompactionCard v-else :compact="segment.compact" />
+                  <ThinkingCard
+                    v-else-if="item.kind === 'reasoning'"
+                    :reasoning="item.reasoning"
+                    :streaming="item.key === generationItems[generationItems.length - 1]?.key"
+                    @toggle="handleCardToggle"
+                  />
+                  <ToolGroupCard
+                    v-else-if="item.kind === 'toolGroup'"
+                    :tools="item.tools"
+                    @toggle="handleCardToggle"
+                  />
+                  <ApprovalCard
+                    v-else-if="item.kind === 'approval'"
+                    :approval="item.approval"
+                    @decide="(approved) => handleDecide(item.approval.requestId, approved)"
+                  />
+                  <CompactionCard v-else :compact="item.compact" />
                 </template>
-                <div v-if="generation.phase !== 'generating'" class="bubble-content thinking">
+                <div
+                  v-if="generation.phase !== 'generating' && generation.phase !== 'approval' && !reasoningStreaming"
+                  class="bubble-content thinking"
+                >
                   <template v-if="generation.phase === 'tooling'">正在调用工具：{{ generation.toolName }}<span class="dots">…</span></template>
                   <template v-else-if="generation.phase === 'compacting'">正在压缩上下文<span class="dots">…</span></template>
                   <template v-else>正在思考<span class="dots">…</span></template>
@@ -397,37 +638,25 @@ function formatSessionTime(iso: string): string {
             ↓ 回到最新消息
           </button>
 
-          <footer class="composer">
+          <footer class="composer-area">
             <p v-if="actionError" class="action-error">{{ actionError }}</p>
-            <div class="composer-row">
-              <textarea
-                v-model="draft"
-                class="composer-input"
-                rows="3"
-                placeholder="输入消息，Enter 发送，Shift + Enter 换行"
-                :disabled="!hasAgents || agentMissing"
-                @keydown="handleKeydown"
-              />
-              <button
-                v-if="!isGenerating"
-                class="btn-primary send-button"
-                type="button"
-                :disabled="!canSend"
-                @click="handleSend"
-              >
-                发送
-              </button>
-              <button
-                v-else
-                class="btn-danger send-button"
-                type="button"
-                :disabled="stopPending"
-                @click="handleStop"
-              >
-                {{ stopPending ? '正在停止…' : '停止生成' }}
-              </button>
-            </div>
-            <p class="composer-hint">Enter 发送 · Shift + Enter 换行 · 生成期间可切换会话（关闭页面会停止生成）</p>
+            <ChatComposer
+              ref="composerRef"
+              :disabled="!hasAgents || agentMissing"
+              :generating="isGenerating"
+              :stop-pending="stopPending"
+              :session-ready="canSend"
+              :preset="activePreset"
+              :model-label="modelLabel"
+              :model-ready="modelReady"
+              :active-model-id="effectiveModelId"
+              :models="modelsStore.models"
+              :usage="usage"
+              @send="handleSend"
+              @stop="handleStop"
+              @change-mode="handleChangeMode"
+              @change-model="handleChangeModel"
+            />
           </footer>
         </template>
       </section>
@@ -667,10 +896,25 @@ function formatSessionTime(iso: string): string {
   margin-bottom: 3px;
 }
 
-.bubble-agent {
+/* 运行状态行（“处理中 1m 52s”）：与轨迹区的状态行一致 */
+.run-status {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
   color: var(--text-secondary);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 600;
+}
+
+.run-mark {
+  color: var(--accent);
+  font-size: 11px;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.bubble-agent {
+  color: var(--text-tertiary);
+  font-size: 10.5px;
 }
 
 .bubble-status {
@@ -711,6 +955,14 @@ function formatSessionTime(iso: string): string {
   display: flex;
   flex-direction: column;
   max-width: 76%;
+}
+
+/* ---- 回到最新消息 ---- */
+
+/* ---- 阶段项目清单卡（阶段化开发 v2） ---- */
+
+.project-strip {
+  padding: 8px 14px 0;
 }
 
 /* ---- 回到最新消息 ---- */
@@ -792,62 +1044,17 @@ function formatSessionTime(iso: string): string {
   white-space: pre-wrap;
 }
 
-/* ---- 输入区 ---- */
+/* ---- 输入区 ----
+ * 输入框本体（正文、档位/用量/模型工具栏）在 ChatComposer 组件内。 */
 
-.composer {
-  padding: 10px 14px 12px;
+.composer-area {
   border-top: 1px solid var(--border);
 }
 
 .action-error {
-  margin-bottom: 8px;
+  margin: 8px 14px 0;
   color: var(--danger);
   font-size: 11.5px;
-}
-
-.composer-row {
-  display: flex;
-  gap: 10px;
-  align-items: flex-end;
-}
-
-.composer-input {
-  flex: 1;
-  min-height: 62px;
-  max-height: 180px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-surface);
-  color: var(--text-primary);
-  font-size: 12.5px;
-  line-height: 1.5;
-  resize: none;
-}
-
-.composer-input:focus {
-  border-color: var(--accent);
-  outline: none;
-}
-
-.composer-input:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.send-button {
-  flex-shrink: 0;
-}
-
-.send-button:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.composer-hint {
-  margin-top: 6px;
-  color: var(--text-tertiary);
-  font-size: 10.5px;
 }
 
 /* ---- 窄屏：压缩会话列表宽度 ---- */

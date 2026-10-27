@@ -1,4 +1,4 @@
-"""运行记录路由：运行列表（分页 / 筛选）、详情时间线与详细载荷（阶段十一）。
+"""运行记录路由：运行列表（分页 / 筛选）、详情时间线与详细载荷。
 
 查询约定：
 - 列表只读 agent_runs 行（快照与汇总字段一次查询取回），不加载事件、
@@ -9,6 +9,7 @@
 """
 
 import json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session

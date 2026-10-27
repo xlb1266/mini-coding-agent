@@ -260,7 +260,9 @@ def _create_async_client(timeout: float) -> httpx.AsyncClient:
 
 # 通用非流式请求的默认超时与输出上限（评分等结构化调用使用）
 GENERAL_TIMEOUT_SECONDS = 120.0
-GENERAL_MAX_TOKENS_LIMIT = 8192
+# 思考型模型的 reasoning token 计入 completion，输出预算过小会导致正文为空；
+# 上限对齐 DeepSeek 思考模式的默认输出额度（64K），调用方按需传更小的值。
+GENERAL_MAX_TOKENS_LIMIT = 65536
 
 
 async def chat_completion_text(
@@ -356,6 +358,11 @@ async def stream_chat_completion_events(
 
     事件（dict）：
     - {"type": "text", "text": str}                     正文增量（按序产出）
+    - {"type": "reasoning", "text": str}                思考增量（推理模型的
+                                                         reasoning_content /
+                                                         reasoning 增量，仅
+                                                         展示用，不进入对话
+                                                         上下文）
     - {"type": "finish", "finish_reason": str | None,   流结束：完整的工具调用列表、
       "tool_calls": [...], "usage": {...} | None}       结束原因与上游返回的用量
 
@@ -427,6 +434,12 @@ async def stream_chat_completion_events(
                     content = delta.get("content")
                     if isinstance(content, str) and content:
                         yield {"type": "text", "text": content}
+                    reasoning = delta.get("reasoning_content")
+                    if not isinstance(reasoning, str) or not reasoning:
+                        # OpenAI 兼容服务对思考增量有两种常见字段名
+                        reasoning = delta.get("reasoning")
+                    if isinstance(reasoning, str) and reasoning:
+                        yield {"type": "reasoning", "text": reasoning}
                     tool_calls.feed(delta.get("tool_calls"))
 
                 yield {

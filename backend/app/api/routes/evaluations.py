@@ -40,6 +40,7 @@ from app.db.models.model_config import ModelConfig
 from app.db.session import get_db, get_session_factory
 from app.schemas.evaluation import (
     CaseResultOut,
+    CompareCaseOut,
     DatasetCreateRequest,
     DatasetDetailOut,
     DatasetOut,
@@ -47,6 +48,7 @@ from app.schemas.evaluation import (
     EvalCaseCreateRequest,
     EvalCaseOut,
     EvalCaseUpdateRequest,
+    TaskCompareOut,
     TaskCreateRequest,
     TaskDetailOut,
     TaskOut,
@@ -262,16 +264,20 @@ def delete_case(dataset_id: int, case_id: int, db: Session = Depends(get_db)) ->
 def _stats_out(results: list[EvalTaskResult]) -> TaskStatsOut:
     counts = {key: 0 for key in _STATS_KEYS.values()}
     scores: list[float] = []
+    process_scores: list[float] = []
     for row in results:
         key = _STATS_KEYS.get(row.status)
         if key is not None:
             counts[key] += 1
         if row.score is not None:
             scores.append(row.score)
+        if row.process_score is not None:
+            process_scores.append(row.process_score)
     return TaskStatsOut(
         total_cases=len(results),
         completed_cases=sum(1 for row in results if row.status in CASE_TERMINAL_STATUSES),
         average_score=(sum(scores) / len(scores)) if scores else None,
+        average_process_score=(sum(process_scores) / len(process_scores)) if process_scores else None,
         **counts,
     )
 
@@ -307,6 +313,8 @@ def _result_out(row: EvalTaskResult) -> CaseResultOut:
         actual_answer=row.actual_answer,
         score=row.score,
         reason=row.reason,
+        process_score=row.process_score,
+        process_reason=row.process_reason,
         run_id=row.run_id,
         run_uid=row.run_uid,
         exec_reason=row.exec_reason,
@@ -444,3 +452,93 @@ async def start_task(
     )
     task = _get_task_or_404(db, task_id)
     return _task_out(task, results)
+
+
+@router.get("/tasks/{base_task_id}/compare/{target_task_id}")
+def compare_tasks(
+    base_task_id: int, target_task_id: int, db: Session = Depends(get_db)
+) -> TaskCompareOut:
+    """回归对比（阶段十五）：对同一数据集的两个任务按用例顺序对照得分。
+
+    base 为旧版本（V1），target 为新版本（V2）；差值 = target - base。
+    通过率口径：通过用例数 / 总用例数（任一侧总用例数为 0 时不计算差值）。
+    """
+    base_task = _get_task_or_404(db, base_task_id)
+    target_task = _get_task_or_404(db, target_task_id)
+    if base_task.dataset_id != target_task.dataset_id:
+        raise HTTPException(
+            status_code=FIELD_ERROR_STATUS,
+            detail="两个任务来自不同的数据集，无法按用例对比；请选择同一数据集的任务",
+        )
+    base_results = (
+        db.query(EvalTaskResult)
+        .filter(EvalTaskResult.task_id == base_task.id)
+        .order_by(EvalTaskResult.case_order)
+        .all()
+    )
+    target_results = (
+        db.query(EvalTaskResult)
+        .filter(EvalTaskResult.task_id == target_task.id)
+        .order_by(EvalTaskResult.case_order)
+        .all()
+    )
+    base_stats = _stats_out(base_results)
+    target_stats = _stats_out(target_results)
+    target_by_order = {row.case_order: row for row in target_results}
+
+    cases: list[CompareCaseOut] = []
+    for base_row in base_results:
+        target_row = target_by_order.get(base_row.case_order)
+        cases.append(
+            CompareCaseOut(
+                case_order=base_row.case_order,
+                question=base_row.question,
+                base_status=base_row.status,
+                target_status=target_row.status if target_row else "（缺少）",
+                base_score=base_row.score,
+                target_score=target_row.score if target_row else None,
+                base_process_score=base_row.process_score,
+                target_process_score=target_row.process_score if target_row else None,
+            )
+        )
+    # target 多出的用例（数据集后来加过用例）也列出来，分数一侧为空
+    for order, target_row in sorted(target_by_order.items()):
+        if all(case.case_order != order for case in cases):
+            cases.append(
+                CompareCaseOut(
+                    case_order=order,
+                    question=target_row.question,
+                    base_status="（缺少）",
+                    target_status=target_row.status,
+                    target_score=target_row.score,
+                    target_process_score=target_row.process_score,
+                )
+            )
+    cases.sort(key=lambda case: case.case_order)
+
+    def _delta(base: float | None, target: float | None) -> float | None:
+        if base is None or target is None:
+            return None
+        return round(target - base, 1)
+
+    base_pass_rate = (
+        base_stats.passed_count / base_stats.total_cases if base_stats.total_cases else None
+    )
+    target_pass_rate = (
+        target_stats.passed_count / target_stats.total_cases if target_stats.total_cases else None
+    )
+    return TaskCompareOut(
+        base_task_id=base_task.id,
+        target_task_id=target_task.id,
+        base_stats=base_stats,
+        target_stats=target_stats,
+        average_score_delta=_delta(base_stats.average_score, target_stats.average_score),
+        average_process_score_delta=_delta(
+            base_stats.average_process_score, target_stats.average_process_score
+        ),
+        pass_rate_delta=_delta(
+            round(base_pass_rate * 100, 1) if base_pass_rate is not None else None,
+            round(target_pass_rate * 100, 1) if target_pass_rate is not None else None,
+        ),
+        cases=cases,
+    )

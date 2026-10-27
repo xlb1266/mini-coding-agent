@@ -20,9 +20,19 @@ class TestList:
             "builtin_current_time",
             "builtin_shell",
             "builtin_file",
+            "builtin_edit_file",
+            "builtin_list_dir",
+            "builtin_grep",
         ]
         assert all(tool["isBuiltin"] and tool["enabled"] for tool in listing)
-        assert [tool["name"] for tool in listing] == ["当前时间", "Shell 命令执行", "文件读写"]
+        assert [tool["name"] for tool in listing] == [
+            "当前时间",
+            "Shell 命令执行",
+            "文件读写",
+            "文件编辑",
+            "目录列表",
+            "内容搜索",
+        ]
 
     def test_list_without_seed_is_empty(self, client: TestClient) -> None:
         assert client.get("/api/tools").json() == []
@@ -32,12 +42,14 @@ class TestList:
 
         detail = client.get(f"/api/tools/{shell['id']}").json()
 
-        assert [param["name"] for param in detail["parameters"]] == ["command", "timeout"]
-        command = detail["parameters"][0]
-        assert command["required"] is True
-        assert command["type"] == "string"
-        assert command["description"]
-        timeout = detail["parameters"][1]
+        assert [param["name"] for param in detail["parameters"]] == [
+            "action", "command", "timeout", "taskId",
+        ]
+        action = detail["parameters"][0]
+        assert action["required"] is False
+        assert action["type"] == "string"
+        assert action["description"]
+        timeout = detail["parameters"][2]
         assert timeout["required"] is False
         # 工具说明包含适用场景 / 输入要求 / 使用限制三部分
         for section in ("适用场景", "输入要求", "使用限制"):

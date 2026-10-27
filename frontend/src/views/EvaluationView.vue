@@ -12,10 +12,12 @@ import { useRouter } from 'vue-router'
 import AppDialog from '../components/AppDialog.vue'
 import PageHeader from '../components/PageHeader.vue'
 import {
+  compareTasks as apiCompareTasks,
   createCase as apiCreateCase,
   updateCase as apiUpdateCase,
   type EvalCaseItem,
   type EvalTaskDetail,
+  type TaskCompare,
 } from '../api/evaluation'
 import { ApiError } from '../api/request'
 import { useAgentsStore } from '../stores/agents'
@@ -252,7 +254,58 @@ const selectedTask = computed<EvalTaskDetail | null>(() =>
 
 watch(selectedTaskId, (id) => {
   if (id !== null && !store.taskDetails[id]) void store.fetchTask(id)
+  resetCompare(id)
 })
+
+// ---- 回归对比（阶段十五）：同一数据集的两个任务按用例对照得分 ----
+
+const compareBaseId = ref<number | null>(null)
+const compareTargetId = ref<number | null>(null)
+const compareLoading = ref(false)
+const compareError = ref('')
+const compareResult = ref<TaskCompare | null>(null)
+
+/** 可参与对比的任务：与当前任务同一数据集且已跑完。 */
+const comparableTasks = computed(() => {
+  const current = selectedTask.value
+  if (!current) return []
+  return store.tasks.filter((task) => task.status === 'completed' && task.datasetId === current.datasetId)
+})
+
+function resetCompare(taskId: number | null): void {
+  compareBaseId.value = taskId
+  compareTargetId.value = null
+  compareResult.value = null
+  compareError.value = ''
+}
+
+function formatDelta(delta: number | null): string {
+  if (delta === null) return '—'
+  return delta > 0 ? `+${delta}` : String(delta)
+}
+
+/** 对比表里单用例得分的差值配色：涨为绿、跌为红、持平中性。 */
+function deltaTone(caseRow: { baseScore: number | null; targetScore: number | null }): string {
+  if (caseRow.baseScore === null || caseRow.targetScore === null) return ''
+  const delta = caseRow.targetScore - caseRow.baseScore
+  if (delta > 0) return 'tone-up'
+  if (delta < 0) return 'tone-down'
+  return ''
+}
+
+async function runCompare(): Promise<void> {
+  if (compareBaseId.value === null || compareTargetId.value === null) return
+  compareLoading.value = true
+  compareError.value = ''
+  try {
+    compareResult.value = await apiCompareTasks(compareBaseId.value, compareTargetId.value)
+  } catch (error) {
+    compareError.value = error instanceof Error ? error.message : '对比失败，请重试'
+    compareResult.value = null
+  } finally {
+    compareLoading.value = false
+  }
+}
 
 async function openTask(id: number): Promise<void> {
   selectedTaskId.value = id
@@ -527,6 +580,9 @@ async function submitTask(andStart: boolean): Promise<void> {
           <span class="stat-chip" :title="'平均分只统计获得合法评分的用例'">
             平均分 {{ formatAverage(selectedTask.stats.averageScore) }}
           </span>
+          <span class="stat-chip" :title="'过程评分均分（LLM Judge 对执行过程合理性的打分）'">
+            过程均分 {{ formatAverage(selectedTask.stats.averageProcessScore) }}
+          </span>
         </div>
 
         <p class="task-config">
@@ -539,6 +595,81 @@ async function submitTask(andStart: boolean): Promise<void> {
             · 提示词版本 v{{ selectedTask.agentConfig.promptVersion }}
           </template>
         </p>
+
+        <!-- 回归对比（阶段十五）：同一数据集的两个任务按用例对照 -->
+        <details class="compare-panel">
+          <summary>回归对比（V1 → V2）</summary>
+          <div class="compare-form">
+            <select v-model="compareBaseId" class="compare-select" aria-label="基准任务">
+              <option v-for="task in comparableTasks" :key="task.id" :value="task.id">
+                V1 · 任务#{{ task.id }} {{ task.agentName }}（{{ formatDateTime(task.createdAt) }}）
+              </option>
+            </select>
+            <span class="compare-arrow">→</span>
+            <select v-model="compareTargetId" class="compare-select" aria-label="对比任务">
+              <option :value="null" disabled>选择对比任务</option>
+              <option v-for="task in comparableTasks" :key="task.id" :value="task.id">
+                V2 · 任务#{{ task.id }} {{ task.agentName }}（{{ formatDateTime(task.createdAt) }}）
+              </option>
+            </select>
+            <button
+              class="btn-primary"
+              type="button"
+              :disabled="compareLoading || compareBaseId === null || compareTargetId === null || compareBaseId === compareTargetId"
+              @click="runCompare"
+            >
+              {{ compareLoading ? '对比中…' : '开始对比' }}
+            </button>
+          </div>
+          <p v-if="compareError" class="list-error">{{ compareError }}</p>
+          <template v-if="compareResult">
+            <div class="compare-summary">
+              <span class="stat-chip">
+                平均分 {{ formatAverage(compareResult.baseStats.averageScore) }} →
+                {{ formatAverage(compareResult.targetStats.averageScore) }}
+                <b class="compare-delta">{{ formatDelta(compareResult.averageScoreDelta) }}</b>
+              </span>
+              <span class="stat-chip">
+                过程均分 {{ formatAverage(compareResult.baseStats.averageProcessScore) }} →
+                {{ formatAverage(compareResult.targetStats.averageProcessScore) }}
+                <b class="compare-delta">{{ formatDelta(compareResult.averageProcessScoreDelta) }}</b>
+              </span>
+              <span class="stat-chip">
+                通过 {{ compareResult.baseStats.passedCount }}/{{ compareResult.baseStats.totalCases }} →
+                {{ compareResult.targetStats.passedCount }}/{{ compareResult.targetStats.totalCases }}
+                <b class="compare-delta">{{ formatDelta(compareResult.passRateDelta) }}%</b>
+              </span>
+            </div>
+            <div class="compare-table-wrap">
+              <table class="compare-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>用例</th>
+                    <th class="is-num">V1 得分</th>
+                    <th class="is-num">V2 得分</th>
+                    <th class="is-num">Δ 得分</th>
+                    <th class="is-num">V1 过程</th>
+                    <th class="is-num">V2 过程</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="caseRow in compareResult.cases" :key="caseRow.caseOrder">
+                    <td>{{ caseRow.caseOrder }}</td>
+                    <td class="compare-question" :title="caseRow.question">{{ caseRow.question }}</td>
+                    <td class="is-num">{{ caseRow.baseScore === null ? '—' : formatScore(caseRow.baseScore) }}</td>
+                    <td class="is-num">{{ caseRow.targetScore === null ? '—' : formatScore(caseRow.targetScore) }}</td>
+                    <td class="is-num" :class="deltaTone(caseRow)">
+                      {{ caseRow.baseScore === null || caseRow.targetScore === null ? '—' : formatDelta(caseRow.targetScore - caseRow.baseScore) }}
+                    </td>
+                    <td class="is-num">{{ caseRow.baseProcessScore === null ? '—' : formatScore(caseRow.baseProcessScore) }}</td>
+                    <td class="is-num">{{ caseRow.targetProcessScore === null ? '—' : formatScore(caseRow.targetProcessScore) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </details>
 
         <ul class="result-items">
           <li v-for="result in selectedTask.results" :key="result.id" class="result-item">
@@ -590,6 +721,13 @@ async function submitTask(andStart: boolean): Promise<void> {
                 <div v-if="result.reason" class="result-field">
                   <span class="result-label">评分理由</span>
                   <p class="result-text">{{ result.reason }}</p>
+                </div>
+                <div v-if="result.processScore !== null" class="result-field">
+                  <span class="result-label">过程评分</span>
+                  <p class="result-text">
+                    {{ formatScore(result.processScore) }} 分
+                    <span v-if="result.processReason" class="result-hint">（{{ result.processReason }}）</span>
+                  </p>
                 </div>
                 <div v-if="result.execError" class="result-field">
                   <span class="result-label">执行失败原因</span>
@@ -802,6 +940,111 @@ async function submitTask(andStart: boolean): Promise<void> {
 </template>
 
 <style scoped>
+/* ---- 回归对比（阶段十五） ---- */
+.compare-panel {
+  margin: 10px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-hover);
+}
+
+.compare-panel summary {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.compare-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.compare-select {
+  height: 28px;
+  max-width: 260px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 11.5px;
+}
+
+.compare-select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.compare-arrow {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.compare-summary {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.compare-delta {
+  margin-left: 4px;
+  color: var(--accent);
+}
+
+.compare-table-wrap {
+  margin-top: 10px;
+  overflow-x: auto;
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.compare-table th,
+.compare-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.compare-table th {
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.compare-table .is-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.compare-question {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.compare-table td.tone-up {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.compare-table td.tone-down {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .tabs {
   display: flex;
   gap: 6px;

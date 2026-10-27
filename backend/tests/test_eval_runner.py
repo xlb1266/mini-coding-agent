@@ -149,6 +149,7 @@ def seed_models_and_agent(
             prompt_version=1,
             model_id=model.id,
             max_rounds=max_rounds,
+            autonomy_mode="autonomous",
             is_default=True,
             created_at=now,
             updated_at=now,
@@ -388,10 +389,15 @@ class TestScorerValidation:
         assert extract_json_object('{"score": 85,') is None
 
     def test_validate_score_payload(self) -> None:
-        assert validate_score_payload({"score": 85, "reason": "对"}) == (85.0, "对")
-        assert validate_score_payload({"score": 0, "reason": "最低"}) == (0.0, "最低")
-        assert validate_score_payload({"score": 100, "reason": "满分"}) == (100.0, "满分")
-        assert validate_score_payload({"score": 99.5, "reason": "x"}) == (99.5, "x")
+        # 过程分缺省为 None（兼容只返回结果分的评分模型）
+        assert validate_score_payload({"score": 85, "reason": "对"}) == (85.0, "对", None, None)
+        assert validate_score_payload({"score": 0, "reason": "最低"}) == (0.0, "最低", None, None)
+        assert validate_score_payload({"score": 100, "reason": "满分"}) == (100.0, "满分", None, None)
+        assert validate_score_payload({"score": 99.5, "reason": "x"}) == (99.5, "x", None, None)
+        # 阶段十五：过程分与理由
+        assert validate_score_payload(
+            {"score": 80, "reason": "对", "processScore": 70, "processReason": "工具使用合理"}
+        ) == (80.0, "对", 70.0, "工具使用合理")
         for bad, message in (
             ({"reason": "缺分数"}, "score"),
             ({"score": "85", "reason": "字符串数字"}, "数字"),
@@ -400,6 +406,9 @@ class TestScorerValidation:
             ({"score": -1, "reason": "越界"}, "0 到 100"),
             ({"score": 85}, "reason"),
             ({"score": 85, "reason": "   "}, "reason"),
+            ({"score": 85, "reason": "对", "processScore": "70"}, "processScore"),
+            ({"score": 85, "reason": "对", "processScore": 120}, "processScore"),
+            ({"score": 85, "reason": "对", "processReason": "   "}, "processReason"),
         ):
             with pytest.raises(ScoringValidationError) as exc:
                 validate_score_payload(bad)

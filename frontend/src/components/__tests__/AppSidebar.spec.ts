@@ -1,5 +1,5 @@
 import { mount } from '@vue/test-utils'
-import { beforeAll, describe, expect, it } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import router from '../../router'
 import AppSidebar from '../AppSidebar.vue'
@@ -7,6 +7,10 @@ import AppSidebar from '../AppSidebar.vue'
 beforeAll(async () => {
   await router.push('/chat')
   await router.isReady()
+})
+
+beforeEach(() => {
+  localStorage.clear()
 })
 
 describe('AppSidebar 侧边导航', () => {
@@ -33,5 +37,32 @@ describe('AppSidebar 侧边导航', () => {
     const active = wrapper.find('.nav-item.router-link-active')
 
     expect(active.text()).toContain('模型管理')
+  })
+
+  it('默认展开；点击切换按钮收起为图标栏并写入 localStorage', async () => {
+    const wrapper = mount(AppSidebar, { global: { plugins: [router] } })
+    const toggle = wrapper.find('.collapse-toggle')
+
+    expect((wrapper.find('.sidebar').element as HTMLElement).classList.contains('is-collapsed')).toBe(false)
+    expect(toggle.text()).toContain('收起')
+
+    await toggle.trigger('click')
+
+    expect((wrapper.find('.sidebar').element as HTMLElement).classList.contains('is-collapsed')).toBe(true)
+    // 收起后菜单文字由 CSS 隐藏（图标栏），按钮变为展开
+    expect(toggle.text()).not.toContain('收起')
+    expect(localStorage.getItem('mini-agent:sidebar-collapsed')).toBe('1')
+
+    await toggle.trigger('click')
+
+    expect((wrapper.find('.sidebar').element as HTMLElement).classList.contains('is-collapsed')).toBe(false)
+    expect(localStorage.getItem('mini-agent:sidebar-collapsed')).toBe('0')
+  })
+
+  it('localStorage 记录收起态时打开即收起', () => {
+    localStorage.setItem('mini-agent:sidebar-collapsed', '1')
+    const wrapper = mount(AppSidebar, { global: { plugins: [router] } })
+
+    expect((wrapper.find('.sidebar').element as HTMLElement).classList.contains('is-collapsed')).toBe(true)
   })
 })

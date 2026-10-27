@@ -142,8 +142,10 @@ describe('RunDetailView 运行详情页', () => {
     const text = wrapper.text()
     expect(text).toContain('Agent 开始')
     expect(text).toContain('模型请求 · 第 1 轮')
-    expect(text).toContain('当前时间')       // 工具卡片（与聊天页同一组件）
-    expect(text).toContain('2026-09-14（Asia/Shanghai）') // 结果摘要
+    // 工具子卡片（与聊天页同一组件）：动作前缀 + 主参数 pill + 耗时
+    expect(text).toContain('查询时间')
+    expect(text).toContain('Asia/Shanghai')
+    expect(text).toContain('12ms')
     expect(text).toContain('运行结束 · 成功')
     expect(text).toContain('现在是中午')
   })

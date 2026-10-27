@@ -114,6 +114,8 @@ class TaskStatsOut(CamelModel):
     executing_cases: int = 0
     scoring_cases: int = 0
     average_score: float | None = None
+    # 过程评分均值（阶段十五）：只统计获得过程分的用例
+    average_process_score: float | None = None
 
 
 class TaskOut(CamelModel):
@@ -154,6 +156,8 @@ class CaseResultOut(CamelModel):
     actual_answer: str | None = None
     score: float | None = None
     reason: str | None = None
+    process_score: float | None = None
+    process_reason: str | None = None
     run_id: int | None = None
     run_uid: str | None = None
     exec_reason: str | None = None
@@ -167,6 +171,33 @@ class CaseResultOut(CamelModel):
 class TaskDetailOut(TaskOut):
     agent_config: dict[str, Any] = {}
     results: list[CaseResultOut] = []
+
+
+class CompareCaseOut(CamelModel):
+    """回归对比中一行用例的两侧得分（按用例顺序对齐）。"""
+
+    case_order: int
+    question: str
+    base_status: str
+    target_status: str
+    base_score: float | None = None
+    target_score: float | None = None
+    base_process_score: float | None = None
+    target_process_score: float | None = None
+
+
+class TaskCompareOut(CamelModel):
+    """两个评测任务的回归对比（阶段十五）：聚合指标差值 + 逐用例得分对照。"""
+
+    base_task_id: int
+    target_task_id: int
+    base_stats: TaskStatsOut
+    target_stats: TaskStatsOut
+    # 差值 = target - base（None 表示一侧没有数据，无法比较）
+    average_score_delta: float | None = None
+    average_process_score_delta: float | None = None
+    pass_rate_delta: float | None = None
+    cases: list[CompareCaseOut] = []
 
 
 # Pydantic 类型/约束错误 → 字段级中文提示（key 为驼峰字段名）

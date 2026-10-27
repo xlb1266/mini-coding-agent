@@ -1,23 +1,44 @@
-"""三个内置工具的具体实现：当前时间、Shell 命令执行、文件读写。
+"""内置工具的具体实现：当前时间、Shell 命令执行、文件读写与编码工具。
 
 工具说明只是给模型和用户的参考，危险操作的限制在这里（执行层）落实：
 - Shell：正则黑名单 + 分段词法分析双重拦截危险命令，并强制超时与输出上限；
 - 文件：所有路径先解析再校验必须落在授权工作区内，限制单次读写大小。
 
+工作区跟随（模块一）：所有 handler 接收 ToolContext，文件类工具的沙箱根
+与 Shell 的工作目录取 context.workspace_root；context 为 None 时回落
+settings.tool_workspace_dir（手动测试端点与旧调用方）。
+
 拦截规则是尽力而为的黑名单，不等于安全沙箱；如需强隔离，
 应把后端整体放在容器或受限账号中运行。
 """
 
-import locale
+import difflib
+import fnmatch
 import re
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.config import settings
-from app.services.tools.base import ToolBlockedError, ToolExecutionError, ToolParamError, ToolTimeoutError
+from app.services.tools.base import (
+    ToolBlockedError,
+    ToolContext,
+    ToolExecutionError,
+    ToolParamError,
+    decode_output,
+)
+from app.services.tools.shell_jobs import (
+    SHELL_JOBS,
+    JobLogFile,
+    OutputCollector,
+    child_env,
+    drain_stream,
+    kill_tree,
+)
 
 _WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 
@@ -29,7 +50,7 @@ _TIMEZONE_HINT = "请使用 IANA 时区名称，例如 Asia/Shanghai、America/N
 # ---------------------------------------------------------------------------
 
 
-def run_current_time(params: dict) -> dict:
+def run_current_time(params: dict, context: ToolContext | None = None) -> dict:
     """返回指定时区（缺省用系统配置默认时区）的当前日期和时间。"""
     raw = str(params.get("timezone") or "").strip() or settings.default_timezone
     try:
@@ -221,42 +242,182 @@ def _normalize_target(target: str) -> str:
     return text.lstrip("/").rstrip("/")
 
 
-def run_shell(params: dict) -> dict:
-    """执行 shell 命令，返回退出码与输出；危险命令、超时在这里被强制落实。"""
+def run_shell(params: dict, context: ToolContext | None = None) -> dict:
+    """Shell 工具统一入口：按 action 分流（run / background / stop / list）。
+
+    危险命令黑名单对 run 与 background 照旧前置；前台执行的整树击杀、
+    阻塞预算保险丝与输出截断落盘在这里落实；后台任务托管见 shell_jobs。
+    """
+    action = str(params.get("action") or "run").strip().lower()
+    if action not in _SHELL_ACTIONS:
+        raise ToolParamError(
+            "action 取值不合法",
+            fields={"action": "action 必须是 run（前台执行）、background（后台启动）、stop（停止任务）或 list（列任务）"},
+        )
+
+    workspace_root = _workspace_root(context)
+
+    if action == "list":
+        jobs = SHELL_JOBS.list(workspace_root)
+        return {"action": "list", "jobs": jobs, "totalJobs": len(jobs)}
+
+    if action == "stop":
+        task_id = str(params.get("taskId") or "").strip()
+        if not task_id:
+            raise ToolParamError("请填写要停止的任务 ID", fields={"taskId": "action=stop 时必须提供 taskId"})
+        return {"action": "stop", **SHELL_JOBS.stop(task_id, workspace_root)}
+
     command = str(params.get("command") or "").strip()
     if not command:
         raise ToolParamError("请填写要执行的命令", fields={"command": "命令不能为空"})
 
-    timeout = params.get("timeout", settings.tool_shell_timeout_seconds)
-    max_timeout = settings.tool_shell_timeout_max_seconds
-    if not 1 <= timeout <= max_timeout:
-        raise ToolParamError(
-            "超时时间超出允许范围",
-            fields={"timeout": f"超时时间须为 1–{max_timeout} 秒的整数"},
-        )
-
+    timeout = _resolve_shell_timeout(params.get("timeout"))
     assert_shell_command_allowed(command)
 
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(command, shell=True, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired as expired:
-        partial = _decode(expired.stdout or b"").strip()
-        detail = f"，已产生的输出：{partial[:200]}" if partial else ""
-        raise ToolTimeoutError(f"命令执行超过 {timeout} 秒，已被终止{detail}") from None
+    if action == "background":
+        job = SHELL_JOBS.start(command, workspace_root)
+        return {
+            "action": "background",
+            **job.to_payload(),
+            "message": (
+                "命令已在后台启动，未被终止，也不会自动超时；稍后用文件读写工具"
+                f"读取输出文件确认进展（read 时可配 tailLines 只看末尾），"
+                "不需要时用 action=stop 并携带 taskId 停止。"
+            ),
+        }
 
-    duration_ms = int((time.monotonic() - started) * 1000)
-    stdout, stdout_clipped = _clip(_decode(completed.stdout or b""))
-    stderr, stderr_clipped = _clip(_decode(completed.stderr or b""))
-    return {
+    return _run_shell_foreground(command, timeout, workspace_root)
+
+
+# 本来就该一直等的命令不适合自动转后台（保险丝豁免清单）
+_WAIT_NATURED_COMMANDS = frozenset({
+    "sleep", "ping", "wait", "pause", "timeout", "yes", "watch", "top", "tailf",
+})
+
+
+# Shell 工具的动作集合（对齐 builtin_file 的 action 模式，工具数量不增加）
+_SHELL_ACTIONS = frozenset({"run", "background", "stop", "list"})
+
+
+def _auto_background_eligible(command: str) -> bool:
+    """保险丝判定：命令是否适合在阻塞预算耗尽时转入后台。"""
+    normalized = " ".join(command.split()).lower()
+    if re.search(r"\btail\s+(-\w+\s+)*-f\b", normalized):
+        return False  # tail -f 本身就是常驻跟随
+    for segment in _SEQUENCE_SPLIT.split(normalized):
+        tokens = [t for t in segment.split() if t]
+        while tokens and tokens[0].strip("\"'") in _SUDO_PREFIX:
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        head = tokens[0].strip("\"'").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if head in _WAIT_NATURED_COMMANDS:
+            return False
+    return True
+
+
+def _resolve_shell_timeout(raw) -> int:
+    """超时秒数解析：非整数报错；超出上限按上限截断不报错（对齐参考实现）。"""
+    max_timeout = settings.tool_shell_timeout_max_seconds
+    if raw is None:
+        return settings.tool_shell_timeout_seconds
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or int(raw) != raw:
+        raise ToolParamError(
+            "超时时间不合法",
+            fields={"timeout": "timeout 须为秒数（整数）"},
+        )
+    return max(1, min(int(raw), max_timeout))
+
+
+def _run_shell_foreground(command: str, timeout: int, workspace_root) -> dict:
+    """前台执行：限时等待；阻塞预算耗尽且适合转后台时转入后台而不是杀掉。
+
+    输出由后台线程实时收集（内存缓冲 + 可选日志落盘），主线程只负责
+    等待与超时判定——这样转后台时输出管道无需交接，模型可以随时用
+    文件工具读到进展。
+    """
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=workspace_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        env=child_env(),
+        start_new_session=(sys.platform != "win32"),  # POSIX 新进程组，树杀要用
+        bufsize=0,  # 无缓冲管道：read1 才能读到零星输出
+    )
+    logfile = JobLogFile()
+    stdout_collector = OutputCollector()
+    stderr_collector = OutputCollector()
+    drain_threads = [
+        threading.Thread(
+            target=drain_stream, args=(process.stdout, stdout_collector, logfile, False), daemon=True
+        ),
+        threading.Thread(
+            target=drain_stream, args=(process.stderr, stderr_collector, logfile, True), daemon=True
+        ),
+    ]
+    for thread in drain_threads:
+        thread.start()
+
+    budget = max(1, settings.tool_shell_blocking_budget_seconds)
+    first_wait = min(budget, timeout)
+    timed_out = False
+    try:
+        process.wait(timeout=first_wait)
+    except subprocess.TimeoutExpired:
+        if first_wait < timeout and _auto_background_eligible(command):
+            # 保险丝：不杀，转后台。收集线程继续把输出写进日志文件，
+            # 任务照常登记退出通知，模型下一轮即可读到进展。
+            job = SHELL_JOBS.adopt(
+                process, command, workspace_root, logfile, stdout_collector, stderr_collector
+            )
+            return {
+                "command": command,
+                "action": "run",
+                "autoBackgrounded": True,
+                **job.to_payload(),
+                "message": (
+                    f"命令执行超过 {first_wait} 秒仍未结束，已自动转入后台且未被终止；"
+                    f"稍后用文件读写工具读取 {job.log_path} 查看进展，"
+                    "不需要时用 action=stop 并携带 taskId 停止。"
+                ),
+            }
+        try:
+            process.wait(timeout=timeout - first_wait)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            kill_tree(process.pid)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    for thread in drain_threads:
+        thread.join(timeout=5)
+    logfile.close()
+
+    stdout, stdout_clipped, stdout_persisted = _clip(stdout_collector.snapshot_text(), workspace_root)
+    stderr, stderr_clipped, stderr_persisted = _clip(stderr_collector.snapshot_text(), workspace_root)
+    result = {
         "command": command,
-        "exitCode": completed.returncode,
-        "success": completed.returncode == 0,
+        "action": "run",
+        "exitCode": None if timed_out else process.returncode,
+        "success": not timed_out and process.returncode == 0,
+        "timedOut": timed_out,
         "stdout": stdout,
         "stderr": stderr,
-        "durationMs": duration_ms,
+        "durationMs": int((time.monotonic() - started) * 1000),
         "truncated": stdout_clipped or stderr_clipped,
     }
+    if timed_out:
+        result["message"] = f"命令执行超过 {timeout} 秒，已被整树终止（进程树内子进程一并结束）"
+    persisted = stdout_persisted or stderr_persisted
+    if persisted:
+        result["persistedOutputPath"] = persisted
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -266,21 +427,25 @@ def run_shell(params: dict) -> dict:
 _WRITE_MODES = ("overwrite", "create", "append")
 
 
-def _workspace_root() -> Path:
-    root = settings.tool_workspace_dir
+def _workspace_root(context: ToolContext | None = None) -> Path:
+    """本次执行的工作区根目录：context 优先，None 回落全局默认；不存在则创建。"""
+    root = context.workspace_root if context is not None else settings.tool_workspace_dir
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def _resolve_in_workspace(raw_path: str) -> Path:
-    """把输入路径解析为绝对路径并确认落在授权工作区内，否则视为非法参数。"""
+def _resolve_in_workspace(raw_path: str, context: ToolContext | None = None) -> Path:
+    """把输入路径解析为绝对路径并确认落在授权工作区内，否则视为非法参数。
+
+    沙箱根取 context.workspace_root（context 为 None 时用全局默认目录）。
+    """
     text = raw_path.strip()
     if not text:
         raise ToolParamError("请填写文件路径", fields={"path": "文件路径不能为空"})
     if "\x00" in text:
         raise ToolParamError("文件路径包含非法字符", fields={"path": "文件路径包含非法字符"})
 
-    root = _workspace_root().resolve()
+    root = _workspace_root(context).resolve()
     candidate = Path(text)
     target = candidate if candidate.is_absolute() else root / candidate
     resolved = target.resolve()
@@ -293,14 +458,26 @@ def _resolve_in_workspace(raw_path: str) -> Path:
     return resolved
 
 
-def run_file(params: dict) -> dict:
+def run_file(params: dict, context: ToolContext | None = None) -> dict:
     action = str(params.get("action") or "").strip().lower()
     if action not in {"read", "write"}:
         raise ToolParamError("action 必须是 read 或 write", fields={"action": "请填写 read（读取）或 write（写入）"})
 
     raw_path = str(params.get("path") or "")
-    target = _resolve_in_workspace(raw_path)
+    target = _resolve_in_workspace(raw_path, context)
 
+    tail_lines = params.get("tail_lines")
+    if action == "read" and tail_lines is not None:
+        if (
+            isinstance(tail_lines, bool)
+            or not isinstance(tail_lines, int)
+            or not 1 <= tail_lines <= _READ_TAIL_MAX_LINES
+        ):
+            raise ToolParamError(
+                "tail_lines 取值不合法",
+                fields={"tail_lines": f"tail_lines 须为 1–{_READ_TAIL_MAX_LINES} 的整数"},
+            )
+        return _read_file(target, raw_path.strip(), tail_lines=tail_lines)
     if action == "read":
         return _read_file(target, raw_path.strip())
 
@@ -316,7 +493,7 @@ def run_file(params: dict) -> dict:
     return _write_file(target, raw_path.strip(), content, mode)
 
 
-def _read_file(target: Path, raw_path: str) -> dict:
+def _read_file(target: Path, raw_path: str, tail_lines: int | None = None) -> dict:
     if not target.exists():
         raise ToolExecutionError(
             f"文件不存在：{target}",
@@ -329,10 +506,32 @@ def _read_file(target: Path, raw_path: str) -> dict:
         )
     size = target.stat().st_size
     limit = settings.tool_file_size_limit
+
+    if tail_lines is not None:
+        # 只读末尾 N 行：从文件末尾最多回看 1MB，适合翻看不断增长的后台
+        # 任务日志（整读会撞大小上限，而且增长中的日志错误多在末尾）
+        window = 1024 * 1024
+        with open(target, "rb") as handle:
+            handle.seek(max(size - window, 0))
+            raw = handle.read()
+        lines = _decode(raw).splitlines()
+        truncated_start = size > window
+        if truncated_start and lines:
+            lines = lines[1:]  # 窗口起点大概率截断了一行，丢弃防乱码
+        return {
+            "action": "read",
+            "path": raw_path,
+            "absolutePath": str(target),
+            "sizeBytes": size,
+            "content": "\n".join(lines[-tail_lines:]),
+            "tailLines": tail_lines,
+            "truncatedStart": truncated_start,
+        }
+
     if size > limit:
         raise ToolExecutionError(
             f"文件过大（{size} 字节），超过单次读取上限 {limit} 字节",
-            hint="请改用 Shell 工具配合 head、tail 等命令分段查看大文件",
+            hint="请改用 tail_lines 参数只读末尾 N 行，或用 Shell 工具配合 head、tail 等命令分段查看",
         )
     return {
         "action": "read",
@@ -377,24 +576,278 @@ def _write_file(target: Path, raw_path: str, content: str, mode: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 文件编辑 / 目录列表 / 内容搜索（模块一）
+# ---------------------------------------------------------------------------
+
+# edit_file 返回的 unified diff 最大字符数（超长截断并标注）
+_DIFF_MAX_LENGTH = 4000
+# list_dir 的遍历限制：最大深度与最大条目数
+_LIST_DIR_MAX_DEPTH = 3
+_LIST_DIR_MAX_ENTRIES = 500
+# grep 的默认与最大返回条数
+_GREP_DEFAULT_MAX_RESULTS = 50
+_GREP_MAX_RESULTS_LIMIT = 200
+
+
+def run_edit_file(params: dict, context: ToolContext | None = None) -> dict:
+    """精确替换文件中的一段内容并返回统一 diff 与替换次数。"""
+    raw_path = str(params.get("path") or "")
+    old_string = params.get("old_string")
+    if not isinstance(old_string, str) or not old_string:
+        raise ToolParamError(
+            "请填写要替换的原内容",
+            fields={"old_string": "old_string 不能为空（为空无法定位替换位置）"},
+        )
+    new_string = params.get("new_string")
+    if not isinstance(new_string, str):
+        raise ToolParamError("请填写替换后的内容", fields={"new_string": "new_string 必须是字符串（删除可传空串）"})
+    replace_all = bool(params.get("replace_all") or False)
+
+    target = _resolve_in_workspace(raw_path, context)
+    if not target.exists():
+        raise ToolExecutionError(
+            f"文件不存在：{target}",
+            hint="编辑前文件必须已存在；请检查路径拼写，路径相对授权工作区根目录解析",
+        )
+    if target.is_dir():
+        raise ToolExecutionError(
+            f"目标是目录而不是文件：{target}",
+            hint="文件编辑工具只能操作文件；查看目录内容请使用 list_dir 工具",
+        )
+    size = target.stat().st_size
+    limit = settings.tool_file_size_limit
+    if size > limit:
+        raise ToolExecutionError(
+            f"文件过大（{size} 字节），超过单次编辑上限 {limit} 字节",
+            hint="请先精简文件，或改用 Shell 工具分段处理大文件",
+        )
+
+    original = _decode(target.read_bytes())
+    count = original.count(old_string)
+    if count == 0:
+        raise ToolExecutionError(
+            "未找到要替换的内容：old_string 在文件中没有出现",
+            hint="请复制文件中的原文（注意空格与缩进），或提供更长更唯一的上下文",
+        )
+    if count > 1 and not replace_all:
+        raise ToolExecutionError(
+            f"要替换的内容出现了多处（共 {count} 处），无法确定替换哪一处",
+            hint="请提供更长更唯一的上下文，或设置 replace_all=true 一次替换全部",
+        )
+    replacements = count if replace_all else 1
+    updated = original.replace(old_string, new_string) if replace_all else original.replace(old_string, new_string, 1)
+
+    data = updated.encode("utf-8")
+    if len(data) > limit:
+        raise ToolExecutionError(f"替换后内容过大（{len(data)} 字节），超过单次写入上限 {limit} 字节")
+    target.write_bytes(data)
+
+    # 统一 diff：标签用相对路径（不泄露绝对路径），超长截断
+    display_path = raw_path.strip()
+    diff_text = "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{display_path}",
+            tofile=f"b/{display_path}",
+        )
+    )
+    if len(diff_text) > _DIFF_MAX_LENGTH:
+        diff_text = diff_text[:_DIFF_MAX_LENGTH] + f"…[diff 过长，已截断：原始长度 {len(diff_text)} 字符]"
+        diff_truncated = True
+    else:
+        diff_truncated = False
+
+    return {
+        "path": display_path,
+        "absolutePath": str(target),
+        "replacements": replacements,
+        "sizeBytes": len(data),
+        "diff": diff_text,
+        "diffTruncated": diff_truncated,
+    }
+
+
+def _list_dir_entry(item: Path, base: Path) -> dict:
+    """目录条目：相对 base 的路径、类型与大小（目录大小记 0）。"""
+    try:
+        rel = item.relative_to(base).as_posix()
+    except ValueError:
+        rel = item.name
+    return {
+        "name": rel,
+        "type": "directory" if item.is_dir() else "file",
+        "sizeBytes": 0 if item.is_dir() else item.stat().st_size,
+    }
+
+
+def _list_dir_sorted(items) -> list[Path]:
+    """目录在前，其余按名称排序，保证返回顺序稳定。"""
+    return sorted(items, key=lambda p: (not p.is_dir(), p.name))
+
+
+def run_list_dir(params: dict, context: ToolContext | None = None) -> dict:
+    """列出工作区内一个目录的内容；recursive=true 时按深度与条目数封顶。"""
+    raw_path = str(params.get("path") or "").strip()
+    recursive = bool(params.get("recursive") or False)
+
+    root = _workspace_root(context).resolve()
+    base = root if not raw_path else _resolve_in_workspace(raw_path, context)
+    if not base.exists():
+        raise ToolExecutionError(
+            f"目录不存在：{base}",
+            hint="请检查路径拼写，路径相对授权工作区根目录解析",
+        )
+    if not base.is_dir():
+        raise ToolExecutionError(
+            f"目标是文件而不是目录：{base}",
+            hint="list_dir 只能列出目录内容；读取文件请使用文件读写工具",
+        )
+
+    entries: list[dict] = []
+    truncated = False
+
+    def _collect(directory: Path, depth: int) -> None:
+        nonlocal truncated
+        if depth > _LIST_DIR_MAX_DEPTH:
+            return
+        for item in _list_dir_sorted(directory.iterdir()):
+            if len(entries) >= _LIST_DIR_MAX_ENTRIES:
+                truncated = True
+                return
+            entries.append(_list_dir_entry(item, base))
+            if item.is_dir():
+                _collect(item, depth + 1)
+                if len(entries) >= _LIST_DIR_MAX_ENTRIES:
+                    truncated = True
+                    return
+
+    if recursive:
+        _collect(base, 1)
+    else:
+        for item in _list_dir_sorted(base.iterdir()):
+            if len(entries) >= _LIST_DIR_MAX_ENTRIES:
+                truncated = True
+                break
+            entries.append(_list_dir_entry(item, base))
+
+    return {
+        "path": raw_path or ".",
+        "recursive": recursive,
+        "entries": entries,
+        "totalEntries": len(entries),
+        "truncated": truncated,
+    }
+
+
+def run_grep(params: dict, context: ToolContext | None = None) -> dict:
+    """在工作区内按正则搜索文件内容，跳过二进制与超限文件。"""
+    raw_pattern = params.get("pattern")
+    if not isinstance(raw_pattern, str) or not raw_pattern.strip():
+        raise ToolParamError("请填写搜索内容", fields={"pattern": "pattern 不能为空"})
+    case_insensitive = bool(params.get("case_insensitive") or False)
+    try:
+        regex = re.compile(raw_pattern, re.IGNORECASE if case_insensitive else 0)
+    except re.error:
+        raise ToolParamError(
+            f"无法识别的正则表达式「{raw_pattern}」",
+            fields={"pattern": "pattern 必须是合法的正则表达式，例如 def\\s+\\w+\\("},
+        ) from None
+
+    max_results = params.get("max_results", _GREP_DEFAULT_MAX_RESULTS)
+    if not isinstance(max_results, int) or isinstance(max_results, bool) or not 1 <= max_results <= _GREP_MAX_RESULTS_LIMIT:
+        raise ToolParamError(
+            "返回条数超出允许范围",
+            fields={"max_results": f"max_results 须为 1–{_GREP_MAX_RESULTS_LIMIT} 的整数，默认 {_GREP_DEFAULT_MAX_RESULTS}"},
+        )
+
+    raw_path = str(params.get("path") or "").strip()
+    raw_glob = params.get("glob")
+    if raw_glob is not None and not isinstance(raw_glob, str):
+        raise ToolParamError("glob 必须是字符串", fields={"glob": "glob 必须是字符串，例如 *.py"})
+    glob = (raw_glob or "").strip() or None
+
+    root = _workspace_root(context).resolve()
+    base = root if not raw_path else _resolve_in_workspace(raw_path, context)
+    if not base.exists():
+        raise ToolExecutionError(
+            f"搜索目录不存在：{base}",
+            hint="请检查路径拼写，路径相对授权工作区根目录解析",
+        )
+    if not base.is_dir():
+        raise ToolExecutionError(
+            f"目标是文件而不是目录：{base}",
+            hint="grep 在目录内递归搜索；读取单个文件请使用文件读写工具",
+        )
+
+    matches: list[dict] = []
+    total = 0
+    files_searched = 0
+    for item in sorted(base.rglob("*")):
+        if not item.is_file():
+            continue
+        if glob and not fnmatch.fnmatch(item.name, glob):
+            continue
+        size = item.stat().st_size
+        if size > settings.tool_file_size_limit:
+            continue  # 超限文件跳过，不报错中断整个搜索
+        raw = item.read_bytes()
+        if b"\x00" in raw:
+            continue  # 二进制文件跳过
+        files_searched += 1
+        text = _decode(raw)
+        rel = item.relative_to(base).as_posix()
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if regex.search(line):
+                total += 1
+                if len(matches) < max_results:
+                    matches.append({"path": rel, "line": line_no, "text": line.strip()})
+
+    return {
+        "pattern": raw_pattern,
+        "path": raw_path or ".",
+        "glob": glob,
+        "matches": matches,
+        "totalMatches": total,
+        "returnedMatches": len(matches),
+        "truncated": total > len(matches),
+        "filesSearched": files_searched,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 共用：输出解码与截断
 # ---------------------------------------------------------------------------
+
+# 文件读取 tail_lines 的上限
+_READ_TAIL_MAX_LINES = 500
 
 
 def _decode(raw: bytes) -> str:
     """优先 UTF-8，其次系统本地编码（中文 Windows 为 GBK），兜底逐字节替换。"""
-    for encoding in ("utf-8", locale.getpreferredencoding(False)):
-        if not encoding:
-            continue
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    return decode_output(raw)
 
 
-def _clip(text: str) -> tuple[str, bool]:
+def _clip(text: str, workspace_root=None) -> tuple[str, bool, str | None]:
+    """超长输出保留头部 60% + 尾部 40%（错误几乎都在末尾）。
+
+    截断发生时把全量文本落盘留底稿并返回路径，模型可用文件工具翻看
+    完整输出；落盘失败不阻断执行，只少一个底稿路径。
+    """
     limit = settings.tool_shell_output_limit
     if len(text) <= limit:
-        return text, False
-    return text[:limit] + f"\n…[输出过长，已截断：原始长度 {len(text)} 字符]", True
+        return text, False, None
+    head_len = int(limit * 0.6)
+    tail_len = limit - head_len
+    omitted = len(text) - head_len - tail_len
+    inline = (
+        f"{text[:head_len]}\n…[中间省略 {omitted} 字符，原始长度 {len(text)} 字符，"
+        f"全量输出已落盘]…\n{text[-tail_len:]}"
+    )
+    persisted = None
+    if workspace_root is not None:
+        try:
+            persisted = SHELL_JOBS.save_output_snapshot(workspace_root, text)
+        except OSError:
+            persisted = None
+    return inline, True, persisted

@@ -8,24 +8,43 @@
  * （正文段 / 工具卡片段），工具卡片用 callId 关联起止事件、原地更新；
  * 运行收尾时仍在执行的卡片标记为“已取消”或“状态未知”，不停留在
  * “正在执行”也不误标成功。已结束运行的时间线按保存消息 id 保留
- * （toolTimelines），无保存消息时以孤儿卡片留在会话末尾（orphanSegments）；
- * 两者只在页面内存中保留，刷新后不恢复（留到运行记录阶段）。
+ * （toolTimelines）；运行中留在内存里，收尾后由后端随消息入库，
+ * 刷新或重新打开会话时从消息自带的 timeline 恢复（seedTimelines）。
  *
  * 阶段十：时间线增加压缩卡片段（kind: 'compact'）——上下文压缩起止用
  * compactionId 配对、原地更新，备用裁剪直接追加；压缩期间的阶段为
  * compacting。卡片只展示估算数字与原因，不包含摘要正文。
+ *
+ * 模块二：时间线增加审批卡片段（kind: 'approval'）——开启审批的 Agent
+ * 执行高风险工具前暂停，approval_request 建卡（pending），approval_result
+ * 用 requestId 配对原地更新为终态（approved/rejected/timeout/cancelled）；
+ * 阶段为 approval。决议经 decideApproval 调用后端接口，等待期间按钮置灰。
+ *
+ * 思考段：时间线增加思考段（kind: 'reasoning'）——推理模型的思考增量
+ * 按事件顺序合并进段，仅用于思考卡片展示，不拼进回复正文（正文取回
+ * 正文段，与后端保存口径一致）。
  */
 
 import { defineStore } from 'pinia'
 
 import {
   createChatSession as apiCreateSession,
+  decideChatApproval as apiDecideApproval,
   getChatMessages as apiGetMessages,
+  getStageProject as apiGetStageProject,
   listChatSessions,
+  nextStageProject as apiNextStageProject,
   openChatEventStream,
   selectChatAgent as apiSelectAgent,
+  selectChatMode as apiSelectMode,
+  selectChatModel as apiSelectModel,
   sendChatMessage as apiSendMessage,
+  startStageProject as apiStartStageProject,
   stopChatGeneration as apiStopGeneration,
+  summarizeStageProject as apiSummarizeStageProject,
+  type ApprovalDecisionStatus,
+  type ApprovalLevel,
+  type AutonomyMode,
   type ChatEvent,
   type ChatGeneration,
   type ChatMessage,
@@ -34,9 +53,12 @@ import {
   type GenerationPhase,
   type GenerationTimelineItem,
   type RunError,
+  type StageProject,
   type ToolResultPayload,
   type ToolType,
 } from '../api/chat'
+
+export type { ApprovalDecisionStatus }
 
 /** 一次生成失败的原因与已生成内容（未保存部分只在内存中）。 */
 export interface GenerationError {
@@ -93,10 +115,32 @@ export interface CompactActivity {
   error?: RunError | null
 }
 
-/** 生成时间线的三种段：正文段、工具卡片段与压缩卡片段，按事件顺序交错。 */
+/** 审批卡片的展示状态：pending 等待决议（按钮可点），其余为终态。 */
+export interface ApprovalActivity {
+  requestId: string
+  callId: string
+  toolName: string
+  displayName: string
+  toolType: ToolType
+  status: ApprovalDecisionStatus
+  arguments: Record<string, unknown> | null
+  /** 决议请求进行中：按钮置灰防重复提交 */
+  deciding?: boolean
+  /** 决议失败时的提示（如审批已被处理） */
+  error?: string | null
+}
+
+/** 生成时间线的段：正文段、思考段、工具/审批/压缩卡片段，按事件顺序交错。 */
 export interface TextSegment {
   kind: 'text'
   text: string
+}
+
+/** 模型思考段（推理模型下发）；仅展示，不拼进正文。 */
+export interface ReasoningSegment {
+  kind: 'reasoning'
+  text: string
+  durationMs?: number | null
 }
 
 export interface ToolSegment {
@@ -104,12 +148,22 @@ export interface ToolSegment {
   tool: ToolActivity
 }
 
+export interface ApprovalSegment {
+  kind: 'approval'
+  approval: ApprovalActivity
+}
+
 export interface CompactSegment {
   kind: 'compact'
   compact: CompactActivity
 }
 
-export type GenerationSegment = TextSegment | ToolSegment | CompactSegment
+export type GenerationSegment =
+  | TextSegment
+  | ReasoningSegment
+  | ToolSegment
+  | ApprovalSegment
+  | CompactSegment
 
 /** 进行中的生成：正文与工具卡片按事件顺序交错保留。 */
 export interface RunningGeneration {
@@ -118,6 +172,10 @@ export interface RunningGeneration {
   phase: GenerationPhase
   agentName: string
   toolName: string | null
+  /** 运行开始时间（epoch 毫秒）：展示“处理中 Xs”；未知时为 null */
+  startedAt: number | null
+  /** 当前思考段的开始时间（本地时钟）：思考结束后据此补上耗时 */
+  reasoningStartedAt: number | null
   segments: GenerationSegment[]
 }
 
@@ -140,6 +198,8 @@ interface ChatState {
   streams: Record<number, AbortController>
   /** 事件流意外断开的连续重连次数（成功收到事件即清零） */
   reconnectAttempts: Record<number, number>
+  /** 阶段项目（阶段化开发 v2）：按项目 id 缓存，随会话切换按需拉取 */
+  stageProjects: Record<number, StageProject>
 }
 
 const MAX_RECONNECT_ATTEMPTS = 3
@@ -175,6 +235,20 @@ function matchCompact(segments: GenerationSegment[], compactionId: string): Comp
   return null
 }
 
+/** 在时间线里定位 requestId 对应的审批卡片。 */
+function matchApproval(
+  segments: GenerationSegment[],
+  requestId: string,
+): ApprovalActivity | null {
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const segment = segments[i]!
+    if (segment.kind === 'approval' && segment.approval.requestId === requestId) {
+      return segment.approval
+    }
+  }
+  return null
+}
+
 /** 收尾扫描：仍在执行的卡片标记为取消或状态未知，不得停留在“执行中”或误标成功。 */
 function finalizeActivities(segments: GenerationSegment[], status: ToolActivityStatus): void {
   for (const segment of segments) {
@@ -183,6 +257,10 @@ function finalizeActivities(segments: GenerationSegment[], status: ToolActivityS
     }
     if (segment.kind === 'compact' && segment.compact.status === 'running') {
       segment.compact.status = status
+    }
+    if (segment.kind === 'approval' && segment.approval.status === 'pending') {
+      // 运行结束（停止/断连）时未决议的审批不再有效
+      segment.approval.status = 'cancelled'
     }
   }
 }
@@ -203,6 +281,12 @@ function segmentsFromTimeline(
   for (const item of timeline) {
     if (item.kind === 'text') {
       segments.push({ kind: 'text', text: item.text })
+    } else if (item.kind === 'reasoning') {
+      segments.push({
+        kind: 'reasoning',
+        text: item.text,
+        durationMs: item.durationMs ?? null,
+      })
     } else if (item.kind === 'tool') {
       segments.push({
         kind: 'tool',
@@ -217,6 +301,19 @@ function segmentsFromTimeline(
           summary: item.summary,
           arguments: item.arguments ?? null,
           result: item.result ?? null,
+        },
+      })
+    } else if (item.kind === 'approval') {
+      segments.push({
+        kind: 'approval',
+        approval: {
+          requestId: item.requestId,
+          callId: item.callId,
+          toolName: item.toolName,
+          displayName: item.displayName || item.toolName,
+          toolType: item.toolType,
+          status: item.status,
+          arguments: item.arguments ?? null,
         },
       })
     } else {
@@ -249,6 +346,8 @@ function toRunningGeneration(generation: ChatGeneration): RunningGeneration {
     phase: generation.phase,
     agentName: generation.agentName,
     toolName: generation.toolName ?? null,
+    startedAt: generation.startedAt ?? null,
+    reasoningStartedAt: null,
     segments: segmentsFromTimeline(generation.timeline, generation.content),
   }
 }
@@ -259,7 +358,20 @@ function generationFromSnapshot(event: Extract<ChatEvent, { type: 'snapshot' }>)
     phase: event.phase,
     agentName: event.agentName,
     toolName: event.toolName,
+    startedAt: event.startedAt ?? null,
+    reasoningStartedAt: null,
     segments: segmentsFromTimeline(event.timeline, event.content),
+  }
+}
+
+/** 收起进行中的思考段：补上耗时（本地计时），下一段思考重新计时。 */
+function closeReasoning(generation: RunningGeneration): void {
+  const startedAt = generation.reasoningStartedAt
+  if (startedAt === null) return
+  generation.reasoningStartedAt = null
+  const last = generation.segments[generation.segments.length - 1]
+  if (last && last.kind === 'reasoning' && (last.durationMs === undefined || last.durationMs === null)) {
+    last.durationMs = Date.now() - startedAt
   }
 }
 
@@ -285,6 +397,7 @@ export const useChatStore = defineStore('chat', {
     orphanSegments: {},
     streams: {},
     reconnectAttempts: {},
+    stageProjects: {},
   }),
   getters: {
     activeSession(state): ChatSessionSummary | null {
@@ -331,6 +444,7 @@ export const useChatStore = defineStore('chat', {
       const result = await apiGetMessages(sessionId)
       this.messagesBySession[sessionId] = result.messages
       this.loadedSessions[sessionId] = true
+      this.seedTimelines(result.messages)
       this.syncSession(result.session)
       if (result.generation) {
         this.generations[sessionId] = toRunningGeneration(result.generation)
@@ -347,6 +461,17 @@ export const useChatStore = defineStore('chat', {
         this.sessions[index] = session
       } else {
         this.sessions.unshift(session)
+      }
+    },
+
+    /** 用消息自带的轨迹恢复卡片（刷新 / 重新打开会话后仍能看到思考行与工具卡片）。
+     *  只补本地还没有轨迹的消息，不覆盖页面内存里更完整的实时时间线。 */
+    seedTimelines(messages: ChatMessage[]): void {
+      for (const message of messages) {
+        if (!message.timeline || message.timeline.length === 0) continue
+        if (this.toolTimelines[message.id]) continue
+        const segments = segmentsFromTimeline(message.timeline, '')
+        if (segments.length > 0) this.toolTimelines[message.id] = segments
       }
     },
 
@@ -383,9 +508,25 @@ export const useChatStore = defineStore('chat', {
       this.abortStream(sessionId)
     },
 
+    /** 对一次审批做出决议：后端决议成功后，approval_result 事件会更新卡片终态。
+     *  等待响应期间按钮置灰防重复提交；失败（如审批已被处理）把错误显示在卡片上。 */
+    async decideApproval(sessionId: number, requestId: string, approved: boolean): Promise<void> {
+      const generation = this.generations[sessionId]
+      if (!generation) return
+      const approval = matchApproval(generation.segments, requestId)
+      if (!approval || approval.status !== 'pending' || approval.deciding) return
+      approval.deciding = true
+      approval.error = null
+      try {
+        await apiDecideApproval(sessionId, requestId, approved ? 'approve' : 'reject')
+      } catch (error) {
+        approval.deciding = false
+        approval.error = error instanceof Error ? error.message : '审批操作失败，请重试'
+      }
+    },
+
     /** 切换会话的 Agent（只影响后续请求）。 */
-    async changeAgent(agentId: number): Promise<void> {
-      const sessionId = this.activeSessionId
+    async changeAgent(agentId: number): Promise<void> {      const sessionId = this.activeSessionId
       if (sessionId === null) {
         return
       }
@@ -394,6 +535,80 @@ export const useChatStore = defineStore('chat', {
       }
       const updated = await apiSelectAgent(sessionId, agentId)
       this.syncSession(updated)
+    },
+
+    /** 切换会话的执行档位（会话级覆盖，只影响当前会话）。 */
+    async changeMode(
+      sessionId: number,
+      approvalLevel: ApprovalLevel,
+      autonomyMode: AutonomyMode,
+    ): Promise<void> {
+      if (this.generations[sessionId]) {
+        throw new Error('当前会话正在生成回复，请等待完成或先停止')
+      }
+      const updated = await apiSelectMode(sessionId, approvalLevel, autonomyMode)
+      this.syncSession(updated)
+    },
+
+    /** 切换会话使用的模型（会话级覆盖，只影响当前会话）。 */
+    async changeModel(sessionId: number, modelId: number): Promise<void> {
+      if (this.generations[sessionId]) {
+        throw new Error('当前会话正在生成回复，请等待完成或先停止')
+      }
+      const updated = await apiSelectModel(sessionId, modelId)
+      this.syncSession(updated)
+    },
+
+    /** 拉取阶段项目详情（失败时返回 null，页面提示为空态）。 */
+    async fetchStageProject(projectId: number): Promise<StageProject | null> {
+      try {
+        const project = await apiGetStageProject(projectId)
+        this.stageProjects[projectId] = project
+        return project
+      } catch {
+        return null
+      }
+    },
+
+    /** 确认计划并开始阶段 1：后端自动新建阶段会话，前端切换过去。
+     *  失败（状态已被推进等）时也刷新一次项目卡，让按钮与真实状态对齐。 */
+    async startStageProject(projectId: number): Promise<void> {
+      try {
+        const result = await apiStartStageProject(projectId)
+        this.stageProjects[projectId] = result.project
+        await this.fetchSessions()
+        await this.selectSession(result.session.id)
+      } catch (error) {
+        void this.fetchStageProject(projectId)
+        throw error
+      }
+    },
+
+    /** 进入下一阶段：后端自动新建阶段会话（带上一阶段交接），前端切换过去。
+     *  全部阶段已完成时会 409：刷新项目卡后按钮会变为「生成项目汇总」。 */
+    async nextStageProject(projectId: number): Promise<void> {
+      try {
+        const result = await apiNextStageProject(projectId)
+        this.stageProjects[projectId] = result.project
+        await this.fetchSessions()
+        await this.selectSession(result.session.id)
+      } catch (error) {
+        void this.fetchStageProject(projectId)
+        throw error
+      }
+    },
+
+    /** 生成项目汇总：后端新建独立汇总会话，前端切换过去。 */
+    async summarizeStageProject(projectId: number): Promise<void> {
+      try {
+        const result = await apiSummarizeStageProject(projectId)
+        this.stageProjects[projectId] = result.project
+        await this.fetchSessions()
+        await this.selectSession(result.session.id)
+      } catch (error) {
+        void this.fetchStageProject(projectId)
+        throw error
+      }
     },
 
     // ---- SSE 订阅与事件处理 ----
@@ -438,7 +653,10 @@ export const useChatStore = defineStore('chat', {
       }
       if (event.type === 'run_start') {
         const generation = this.generations[sessionId]
-        if (generation) generation.runId = event.runId
+        if (generation) {
+          generation.runId = event.runId
+          if (typeof event.startedAt === 'number') generation.startedAt = event.startedAt
+        }
         return
       }
       if (event.type === 'model_request_start' || event.type === 'model_request_end') {
@@ -451,6 +669,8 @@ export const useChatStore = defineStore('chat', {
       if (event.runId !== '' && generation.runId !== null && event.runId !== generation.runId) {
         return
       }
+      // 思考段在第一个非思考事件到达时收起并补耗时（正文/工具/审批/压缩等）
+      if (event.type !== 'reasoning_delta') closeReasoning(generation)
 
       if (event.type === 'text_delta') {
         // 工具调用前后、各轮次的正文都按序追加，不覆盖；与上一段正文相连时合并
@@ -461,6 +681,17 @@ export const useChatStore = defineStore('chat', {
           generation.segments.push({ kind: 'text', text: event.text })
         }
         if (generation.phase !== 'generating') generation.phase = 'generating'
+        return
+      }
+      if (event.type === 'reasoning_delta') {
+        // 思考增量只进时间线展示：与上一段思考相连时合并，不拼进正文
+        const last = generation.segments[generation.segments.length - 1]
+        if (last && last.kind === 'reasoning') {
+          last.text += event.text
+        } else {
+          generation.segments.push({ kind: 'reasoning', text: event.text })
+        }
+        if (generation.reasoningStartedAt === null) generation.reasoningStartedAt = Date.now()
         return
       }
       if (event.type === 'tool_call_start') {
@@ -492,6 +723,33 @@ export const useChatStore = defineStore('chat', {
           tool.durationMs = event.durationMs
           tool.summary = event.summary
           tool.result = event.result ?? null
+        }
+        return
+      }
+      if (event.type === 'approval_request') {
+        // 审批卡片进入时间线；等待决议期间阶段标记为 approval
+        generation.phase = 'approval'
+        generation.segments.push({
+          kind: 'approval',
+          approval: {
+            requestId: event.requestId,
+            callId: event.callId,
+            toolName: event.toolName,
+            displayName: event.displayName || event.toolName,
+            toolType: event.toolType,
+            status: 'pending',
+            arguments: event.arguments ?? null,
+          },
+        })
+        return
+      }
+      if (event.type === 'approval_result') {
+        generation.phase = segmentsText(generation.segments) ? 'generating' : 'thinking'
+        // requestId 配对、原地更新审批卡片终态
+        const approval = matchApproval(generation.segments, event.requestId)
+        if (approval) {
+          approval.status = event.decision
+          approval.deciding = false
         }
         return
       }
@@ -571,7 +829,7 @@ export const useChatStore = defineStore('chat', {
       } else {
         // 没有保存消息（取消且无正文 / 保存失败）：卡片单独留在会话末尾
         this.orphanSegments[sessionId] = generation.segments.filter(
-          (segment): segment is ToolSegment | CompactSegment => segment.kind !== 'text',
+          (segment): segment is Exclude<GenerationSegment, TextSegment> => segment.kind !== 'text',
         )
       }
     },
@@ -601,6 +859,7 @@ export const useChatStore = defineStore('chat', {
           this.subscribeEvents(sessionId)
         } else {
           // 生成已结束：用后端最终状态补齐（终态事件可能没收到）
+          this.seedTimelines(result.messages)
           for (const message of result.messages) {
             this.upsertMessage(message)
           }
@@ -619,7 +878,7 @@ export const useChatStore = defineStore('chat', {
       finalizeActivities(generation.segments, 'unknown')
       if (hasActivity(generation.segments)) {
         this.orphanSegments[sessionId] = generation.segments.filter(
-          (segment): segment is ToolSegment | CompactSegment => segment.kind !== 'text',
+          (segment): segment is Exclude<GenerationSegment, TextSegment> => segment.kind !== 'text',
         )
       }
       this.generationErrors[sessionId] = {

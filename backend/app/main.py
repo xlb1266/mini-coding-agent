@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import agents, chat, evaluations, health, mcp, models, runs, skills, tools
+from app.api.routes import agents, chat, evaluations, health, mcp, models, runs, skills, system, tools
 from app.core.config import settings
 from app.db.session import get_session_factory
 from app.schemas.agent import FIELD_ERROR_MESSAGES as AGENT_FIELD_ERRORS
@@ -86,6 +86,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api")
     app.include_router(runs.router, prefix="/api")
     app.include_router(evaluations.router, prefix="/api")
+    app.include_router(system.router, prefix="/api")
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
     return app

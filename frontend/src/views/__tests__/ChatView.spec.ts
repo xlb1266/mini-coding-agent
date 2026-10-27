@@ -27,14 +27,28 @@ vi.mock('../../api/agents', () => ({
   setDefaultAgent: vi.fn(),
 }))
 
-vi.mock('../../api/chat', () => ({
+// 保留 matchModePreset / MODE_PRESETS 等纯逻辑导出，只替换网络请求函数
+vi.mock('../../api/chat', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../api/chat')>()),
   listChatSessions: vi.fn(),
   createChatSession: vi.fn(),
   getChatMessages: vi.fn(),
   selectChatAgent: vi.fn(),
+  selectChatMode: vi.fn(),
+  selectChatModel: vi.fn(),
+  getChatContextUsage: vi.fn().mockRejectedValue(new Error('not mocked')),
   sendChatMessage: vi.fn(),
   stopChatGeneration: vi.fn(),
   openChatEventStream: vi.fn(),
+}))
+
+vi.mock('../../api/models', () => ({
+  listModels: vi.fn().mockResolvedValue([]),
+  createModel: vi.fn(),
+  updateModel: vi.fn(),
+  deleteModel: vi.fn(),
+  setDefaultModel: vi.fn(),
+  testModel: vi.fn(),
 }))
 
 function makeAgent(): AgentItem {
@@ -45,6 +59,10 @@ function makeAgent(): AgentItem {
     model: { id: 1, displayName: 'DeepSeek-V3', modelIdentifier: 'deepseek-chat' },
     promptVersion: 1,
     maxRounds: 25,
+    workspaceDir: '',
+    approvalLevel: 'off',
+    autonomyMode: 'stage_confirm',
+    shellWhitelist: '',
     autoCompact: true,
     compactThreshold: 80,
     compactKeepRounds: 4,
@@ -250,9 +268,9 @@ describe('ChatView 发送与停止', () => {
     const wrapper = await mountView()
     const textarea = wrapper.find('textarea')
     await textarea.setValue('   ')
-    const button = wrapper.findAll('button').find((b) => b.text() === '发送')
+    const button = wrapper.find('.send-button')
 
-    expect(button!.attributes('disabled')).toBeDefined()
+    expect(button.attributes('disabled')).toBeDefined()
   })
 
   it('发送失败时保留输入内容并提示原因', async () => {
@@ -289,10 +307,11 @@ describe('ChatView 发送与停止', () => {
 
     expect(wrapper.text()).toContain('正在思考')
     expect(wrapper.find('.agent-select').attributes('disabled')).toBeDefined()
-    const stopButton = wrapper.findAll('button').find((b) => b.text() === '停止生成')
-    expect(stopButton).toBeTruthy()
+    // 生成中输入框右下角的发送按钮切换为停止按钮（图标态）
+    const stopButton = wrapper.find('.send-button.is-stop')
+    expect(stopButton.exists()).toBe(true)
 
-    await stopButton!.trigger('click')
+    await stopButton.trigger('click')
     await flushPromises()
 
     expect(stopChatGeneration).toHaveBeenCalledWith(1)
@@ -350,7 +369,7 @@ describe('ChatView 切换 Agent', () => {
 })
 
 describe('ChatView 工具过程展示', () => {
-  it('生成中：工具卡片与正文按事件顺序交错，运行中的卡片显示执行中', async () => {
+  it('生成中：默认只显示“使用N个工具”一行，点击才展开子卡片与参数', async () => {
     makeAgentsAndSession()
     const { useChatStore } = await import('../../stores/chat')
     const pinia = createPinia()
@@ -360,6 +379,8 @@ describe('ChatView 工具过程展示', () => {
     const store = useChatStore()
     store.generations[1] = {
       runId: 'r1',
+      startedAt: null,
+      reasoningStartedAt: null,
       phase: 'tooling',
       agentName: '测试助手',
       toolName: '当前时间',
@@ -382,12 +403,20 @@ describe('ChatView 工具过程展示', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('先查时间：')
-    expect(wrapper.text()).toContain('当前时间')
-    expect(wrapper.text()).toContain('执行中')
+    expect(wrapper.text()).toContain('处理中')
     expect(wrapper.text()).toContain('正在调用工具：当前时间')
-    // 正文在卡片上方（DOM 顺序）
+    // 工具默认折叠：只有组标题行，看不到子卡片与参数
+    expect(wrapper.text()).toContain('使用1个工具')
+    expect(wrapper.text()).not.toContain('查询时间')
+    expect(wrapper.text()).not.toContain('Asia/Shanghai')
+
+    await wrapper.find('.tool-group-head').trigger('click')
+    expect(wrapper.text()).toContain('查询时间')
+    expect(wrapper.find('.tool-pill').text()).toBe('Asia/Shanghai')
+    expect(wrapper.find('.tool-status-icon').attributes('aria-label')).toBe('执行中')
+    // 正文在工具组上方（DOM 顺序）
     const bubble = wrapper.find('.is-streaming')
-    expect(bubble.text().indexOf('先查时间：')).toBeLessThan(bubble.text().indexOf('当前时间'))
+    expect(bubble.text().indexOf('先查时间：')).toBeLessThan(bubble.text().indexOf('使用1个工具'))
   })
 
   it('已结束回复带时间线：卡片与正文交错渲染在消息气泡内', async () => {
@@ -423,9 +452,11 @@ describe('ChatView 工具过程展示', () => {
     await flushPromises()
 
     const text = wrapper.text()
-    expect(text).toContain('完成')
+    expect(text).toContain('使用1个工具')
     expect(text.indexOf('先查时间：')).toBeLessThan(text.indexOf('上午十点'))
-    expect(wrapper.findAllComponents({ name: 'ToolCallCard' }).length).toBe(1)
+    expect(wrapper.findAllComponents({ name: 'ToolGroupCard' }).length).toBe(1)
+    // 已结束的运行同样默认收起，卡片不直接铺开
+    expect(wrapper.find('.tool-card').exists()).toBe(false)
   })
 
   it('无保存消息的收尾运行：孤儿卡片渲染在消息之后', async () => {
@@ -452,7 +483,32 @@ describe('ChatView 工具过程展示', () => {
     await flushPromises()
 
     expect(wrapper.find('.tool-orphan').exists()).toBe(true)
-    expect(wrapper.text()).toContain('已取消')
+    expect(wrapper.text()).toContain('使用1个工具')
+    expect(wrapper.text()).toContain('1 个已取消')
+  })
+
+  it('运行中显示“处理中 + 已用时长”，思考默认收起、点击才看正文', async () => {
+    makeAgentsAndSession()
+    vi.mocked(getChatMessages).mockResolvedValue({
+      session: makeSession({ isGenerating: true }),
+      messages: [makeMessage()],
+      generation: {
+        phase: 'thinking',
+        content: '',
+        agentName: '测试助手',
+        startedAt: Date.now() - 112_000,
+        timeline: [{ kind: 'reasoning', text: '先看看目录结构', durationMs: null }],
+      },
+    })
+
+    const wrapper = await mountView()
+
+    expect(wrapper.text()).toContain('处理中 1m 52s')
+    expect(wrapper.text()).toContain('思考中')
+    expect(wrapper.text()).not.toContain('先看看目录结构')
+
+    await wrapper.find('.think-head').trigger('click')
+    expect(wrapper.text()).toContain('先看看目录结构')
   })
 
   it('上翻暂停跟随后显示“回到最新消息”，点击后回到底部并恢复跟随', async () => {

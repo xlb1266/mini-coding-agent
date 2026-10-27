@@ -115,6 +115,52 @@ textarea {
   display: block;
 }
 
+/* ---- 侧边栏收起切换（底部按钮，状态记入 localStorage） ---- */
+
+.collapse-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+  height: 30px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.collapse-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* 收起态：56px 图标栏（与窄屏自动收起同款布局） */
+.sidebar.is-collapsed {
+  width: 56px;
+  padding: 14px 8px;
+}
+
+.sidebar.is-collapsed .brand {
+  justify-content: center;
+  padding: 2px 0 14px;
+}
+
+.sidebar.is-collapsed .brand-name,
+.sidebar.is-collapsed .nav-label,
+.sidebar.is-collapsed .toggle-label {
+  display: none;
+}
+
+.sidebar.is-collapsed .nav-item,
+.sidebar.is-collapsed .collapse-toggle {
+  justify-content: center;
+  padding: 0;
+}
+
 .app-main {
   flex: 1;
   min-width: 0;

@@ -17,22 +17,77 @@ function makeTool(overrides: Partial<ToolActivity> = {}): ToolActivity {
 }
 
 describe('ToolCallCard 收起态', () => {
-  it('显示易读名称、类型、状态文字与图标和摘要，不显示参数', () => {
+  it('默认收起：只有动作前缀、主参数与状态图标，不显示调用参数与返回结果', () => {
     const wrapper = mount(ToolCallCard, {
-      props: { tool: makeTool({ status: 'success', durationMs: 1500, summary: '2026-09-12T10:00:00' }) },
+      props: {
+        tool: makeTool({
+          status: 'success',
+          durationMs: 1500,
+          arguments: { timezone: 'Asia/Shanghai' },
+          result: { text: '{"datetime":"10:00"}', truncated: false, totalLength: 19 },
+        }),
+      },
     })
 
-    expect(wrapper.text()).toContain('当前时间')
-    expect(wrapper.text()).toContain('内置工具')
-    // 状态同时有文字与视觉标识（不只靠颜色）
-    expect(wrapper.text()).toContain('完成')
-    expect(wrapper.find('.tool-status-icon').text()).toBe('✓')
+    expect(wrapper.text()).toContain('查询时间')
+    expect(wrapper.find('.tool-pill').text()).toBe('Asia/Shanghai')
     expect(wrapper.text()).toContain('1.5s')
-    expect(wrapper.text()).toContain('2026-09-12T10:00:00')
+    // 状态用图标 + 可访问名称标注（不只靠颜色）
+    expect(wrapper.find('.tool-status-icon').text()).toBe('✓')
+    expect(wrapper.find('.tool-status-icon').attributes('aria-label')).toBe('完成')
+    // 详细内容默认不可见
     expect(wrapper.find('.tool-card-body').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('调用参数')
+    expect(wrapper.text()).not.toContain('datetime')
   })
 
-  it('MCP 工具同时展示 Server 名称与工具名', () => {
+  it('内置文件工具用扩展名徽标与“已读取：”前缀', () => {
+    const wrapper = mount(ToolCallCard, {
+      props: {
+        tool: makeTool({
+          toolName: 'builtin_file',
+          displayName: '文件读写',
+          status: 'success',
+          arguments: { action: 'read', path: 'src/agent.ts' },
+        }),
+      },
+    })
+
+    expect(wrapper.find('.tool-badge').text()).toBe('TS')
+    expect(wrapper.text()).toContain('已读取：')
+    expect(wrapper.find('.tool-pill').text()).toBe('src/agent.ts')
+  })
+
+  it('搜索工具显示“搜索文件”与搜索词，Shell 显示“执行命令”', () => {
+    const grep = mount(ToolCallCard, {
+      props: {
+        tool: makeTool({
+          toolName: 'builtin_grep',
+          displayName: '内容搜索',
+          status: 'success',
+          arguments: { pattern: '**/*.md', path: 'src' },
+        }),
+      },
+    })
+    expect(grep.text()).toContain('搜索文件')
+    expect(grep.find('.tool-pill').text()).toBe('**/*.md')
+    expect(grep.find('.tool-badge').text()).toBe('⌕')
+
+    const shell = mount(ToolCallCard, {
+      props: {
+        tool: makeTool({
+          toolName: 'builtin_shell',
+          displayName: 'Shell 命令',
+          status: 'success',
+          arguments: { command: 'npm run build' },
+        }),
+      },
+    })
+    expect(shell.text()).toContain('执行命令')
+    expect(shell.find('.tool-pill').text()).toBe('npm run build')
+  })
+
+  it('MCP 工具用 Server 工具名做主标题', () => {
     const wrapper = mount(ToolCallCard, {
       props: {
         tool: makeTool({
@@ -40,31 +95,45 @@ describe('ToolCallCard 收起态', () => {
           toolName: 'mcp3_get_weather',
           displayName: 'get_weather',
           serverName: '天气服务',
+          arguments: { city: '北京' },
         }),
       },
     })
 
-    expect(wrapper.find('.tool-name').text()).toBe('天气服务 · get_weather')
-    expect(wrapper.text()).toContain('MCP')
+    expect(wrapper.text()).toContain('get_weather')
+    expect(wrapper.find('.tool-badge').text()).toBe('⚙')
+    expect(wrapper.find('.tool-pill').text()).toBe('北京')
   })
 
-  it('失败与取消使用不同的文字和图标标注', () => {
+  it('失败与取消使用不同的图标和可访问名称标注', () => {
     const failed = mount(ToolCallCard, { props: { tool: makeTool({ status: 'error' }) } })
-    expect(failed.text()).toContain('失败')
     expect(failed.find('.tool-status-icon').text()).toBe('✕')
+    expect(failed.find('.tool-status-icon').attributes('aria-label')).toBe('失败')
 
     const cancelled = mount(ToolCallCard, { props: { tool: makeTool({ status: 'cancelled' }) } })
-    expect(cancelled.text()).toContain('已取消')
     expect(cancelled.find('.tool-status-icon').text()).toBe('○')
+    expect(cancelled.find('.tool-status-icon').attributes('aria-label')).toBe('已取消')
 
     const unknown = mount(ToolCallCard, { props: { tool: makeTool({ status: 'unknown' }) } })
-    expect(unknown.text()).toContain('状态未知')
     expect(unknown.find('.tool-status-icon').text()).toBe('?')
+    expect(unknown.find('.tool-status-icon').attributes('aria-label')).toBe('状态未知')
+  })
+
+  it('没有字符串参数时用结果摘要兜底；两者都没有则不显示 pill', () => {
+    const withSummary = mount(ToolCallCard, {
+      props: {
+        tool: makeTool({ arguments: { count: 3 }, summary: '12 个条目' }),
+      },
+    })
+    expect(withSummary.find('.tool-pill').text()).toBe('12 个条目')
+
+    const bare = mount(ToolCallCard, { props: { tool: makeTool() } })
+    expect(bare.find('.tool-pill').exists()).toBe(false)
   })
 })
 
 describe('ToolCallCard 展开态', () => {
-  it('展开显示整理后的输入参数与结果，收起后隐藏', async () => {
+  it('点击才展开调用参数与返回结果，再点击收起', async () => {
     const wrapper = mount(ToolCallCard, {
       props: {
         tool: makeTool({
@@ -78,16 +147,18 @@ describe('ToolCallCard 展开态', () => {
     await wrapper.find('.tool-card-head').trigger('click')
 
     expect(wrapper.find('.tool-card-body').exists()).toBe(true)
-    const keys = wrapper.findAll('.arg-key').map((el) => el.text())
-    expect(keys).toEqual(['timezone', 'count'])
-    expect(wrapper.text()).toContain('Asia/Shanghai')
+    expect(wrapper.text()).toContain('调用参数')
+    expect(wrapper.find('.tool-code').text()).toBe(
+      '{\n  "timezone": "Asia/Shanghai",\n  "count": 3\n}',
+    )
+    expect(wrapper.text()).toContain('返回结果')
     expect(wrapper.find('.tool-result').text()).toContain('"datetime": "10:00"')
 
     await wrapper.find('.tool-card-head').trigger('click')
     expect(wrapper.find('.tool-card-body').exists()).toBe(false)
   })
 
-  it('失败时展示可读的失败原因，不出现堆栈', () => {
+  it('失败时展开显示可读的失败原因，不出现堆栈', async () => {
     const wrapper = mount(ToolCallCard, {
       props: {
         tool: makeTool({
@@ -99,11 +170,10 @@ describe('ToolCallCard 展开态', () => {
     })
 
     expect(wrapper.text()).not.toContain('失败原因') // 收起态不显示区块标题
-    return wrapper.find('.tool-card-head').trigger('click').then(() => {
-      expect(wrapper.text()).toContain('失败原因')
-      expect(wrapper.text()).toContain('无法识别的时区')
-      expect(wrapper.text()).not.toContain('Traceback')
-    })
+    await wrapper.find('.tool-card-head').trigger('click')
+    expect(wrapper.text()).toContain('失败原因')
+    expect(wrapper.text()).toContain('无法识别的时区')
+    expect(wrapper.text()).not.toContain('Traceback')
   })
 
   it('长结果默认只展示前段并标注截断，“展开全部”后显示完整内容', async () => {
@@ -175,5 +245,13 @@ describe('ToolCallCard 展开态', () => {
     expect(wrapper.find('img').exists()).toBe(false)
     expect(wrapper.find('script').exists()).toBe(false)
     expect(wrapper.text()).toContain('<img src=x onerror=alert(1)>')
+  })
+
+  it('展开/收起向父级发出 toggle 事件，便于保持滚动位置', async () => {
+    const wrapper = mount(ToolCallCard, { props: { tool: makeTool() } })
+
+    await wrapper.find('.tool-card-head').trigger('click')
+
+    expect(wrapper.emitted('toggle')).toHaveLength(1)
   })
 })

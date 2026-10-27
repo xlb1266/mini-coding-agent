@@ -15,12 +15,26 @@ SSE 事件（data 为 JSON，驼峰字段）：
 - {"type":"run_start","runId","seq","agentName"}     运行开始
 - {"type":"model_request_start"|"model_request_end"} 模型请求起止（callId 配对）
 - {"type":"text_delta","runId","seq","round","callId","text"}   正文增量
+- {"type":"reasoning_delta","runId","seq","round","callId","text"}
+                                                     思考增量（推理模型
+                                                     经 reasoning_content /
+                                                     reasoning 下发；仅进
+                                                     入展示时间线，不保存
+                                                     进回复正文）
 - {"type":"tool_call_start",...,"arguments","serverName"}
                                                      工具调用开始（含整理后参数）
 - {"type":"tool_call_end",...,"status","summary","result"}
                                                      工具调用结束（status 含
                                                      cancelled；result 为整理
                                                      后的展示文本）
+- {"type":"approval_request",...,"requestId","callId","arguments"}
+                                                     工具执行审批请求（开启
+                                                     审批的 Agent 命中审批
+                                                     范围时下发，等待用户决议）
+- {"type":"approval_result",...,"requestId","decision"}
+                                                     审批决定（approved /
+                                                     rejected / timeout /
+                                                     cancelled）
 - {"type":"context_compaction_start"|"context_compaction_end",...}
                                                      上下文压缩起止（触发
                                                      原因、前后估算 Token、
@@ -41,7 +55,9 @@ run_end 的 status：completed（已完成并保存）/ cancelled（已停止，
 """
 
 import asyncio
+import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -50,7 +66,9 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import settings
 from app.core.secret_box import SecretBox
+from app.db.models.agent import Agent
 from app.db.models.chat import (
     ChatMessage,
     ChatSession,
@@ -60,26 +78,48 @@ from app.db.models.chat import (
     STATUS_INCOMPLETE,
 )
 from app.db.models.model_config import ModelConfig
+from app.db.models.stage_project import (
+    PROJECT_AWAITING_START,
+    PROJECT_AWAITING_SUMMARY,
+    PROJECT_COMPLETED,
+    PROJECT_IN_PROGRESS,
+    PROJECT_ROLE_PLAN,
+    PROJECT_ROLE_SUMMARY,
+    PROJECT_SUMMARIZING,
+    StageProject,
+)
 from app.schemas.chat import (
     DEFAULT_SESSION_TITLE,
     SESSION_TITLE_SNIPPET_LENGTH,
     ChatMessageOut,
 )
 from app.services.agent_runtime import (
+    APPROVAL_REQUEST,
+    APPROVAL_RESULT,
     CONTEXT_COMPACTION_END,
     CONTEXT_COMPACTION_START,
     CONTEXT_TRIM,
     REASON_CANCELLED,
+    REASONING_DELTA,
     RUN_END,
     RUN_START,
     STATUS_CANCELLED,
     STATUS_COMPLETED,
+    STATUS_ERROR,
+    STATUS_PLAN_SUBMITTED,
+    STATUS_ROUNDS_EXHAUSTED,
+    STATUS_STAGE_COMPLETE,
     TEXT_DELTA,
     TOOL_CALL_END,
     TOOL_CALL_START,
     AgentRuntime,
+    ApprovalHooks,
     RuntimeRequest,
     redact,
+)
+from app.services.approvals import (
+    DECISION_CANCELLED,
+    approval_registry,
 )
 from app.services.model_client import ERROR_TYPE_SERVER
 from app.services.run_recorder import RunRecorder
@@ -91,11 +131,15 @@ from app.services.token_estimation import (
 logger = logging.getLogger(__name__)
 
 # 生成阶段：thinking 尚无正文；generating 正文流式输出中；tooling 工具执行中；
-# compacting 正在压缩上下文（生成长会话摘要）
+# compacting 正在压缩上下文（生成长会话摘要）；approval 等待用户审批工具执行
 PHASE_THINKING = "thinking"
 PHASE_GENERATING = "generating"
 PHASE_TOOLING = "tooling"
 PHASE_COMPACTING = "compacting"
+PHASE_APPROVAL = "approval"
+
+# 轨迹里思考正文入库前的长度上限（与工具结果展示上限同量级）
+TIMELINE_REASONING_MAX_LENGTH = 4000
 
 # 终态事件类型
 EVENT_RUN_END = RUN_END
@@ -157,6 +201,7 @@ def estimate_context_tokens(system_prompt: str, history: list[ChatMessage], new_
 
 
 def message_to_out(message: ChatMessage) -> ChatMessageOut:
+    """消息转输出模型；assistant 消息带入库的过程轨迹（纯文字回复为 None）。"""
     return ChatMessageOut(
         id=message.id,
         session_id=message.session_id,
@@ -167,12 +212,33 @@ def message_to_out(message: ChatMessage) -> ChatMessageOut:
         agent_name=message.agent_name,
         seq=message.seq,
         created_at=message.created_at,
+        timeline=parse_stored_timeline(message.timeline_json),
     )
 
 
+def parse_stored_timeline(raw: str | None) -> list[dict[str, Any]] | None:
+    """解析入库的轨迹 JSON；缺失或损坏时返回 None（按纯文字回复展示）。"""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    items = [item for item in parsed if isinstance(item, dict)]
+    return items or None
+
+
 def message_event_payload(message: ChatMessage) -> dict[str, Any]:
-    """把已保存的消息转成 SSE 事件里使用的驼峰 JSON 字典。"""
-    return message_to_out(message).model_dump(by_alias=True, mode="json")
+    """把已保存的消息转成 SSE 事件里使用的驼峰 JSON 字典。
+
+    不带轨迹：同一批事件已由运行记录保存，重复下发只会放大载荷；页面渲染
+    用内存时间线，刷新后从 /messages 读取。
+    """
+    payload = message_to_out(message).model_dump(by_alias=True, mode="json")
+    payload.pop("timeline", None)
+    return payload
 
 
 def timeline_append_text(timeline: list[dict[str, Any]], text: str) -> None:
@@ -181,6 +247,67 @@ def timeline_append_text(timeline: list[dict[str, Any]], text: str) -> None:
         timeline[-1]["text"] += text
     else:
         timeline.append({"kind": "text", "text": text})
+
+
+def timeline_append_reasoning(run: "GenerationRun", text: str) -> None:
+    """思考增量并入时间线：与上一段思考相连时合并，否则新起一段。
+
+    思考只进展示时间线，不累计进 run.content（回复正文）。
+    """
+    timeline = run.timeline
+    if timeline and timeline[-1].get("kind") == "reasoning":
+        timeline[-1]["text"] += text
+    else:
+        timeline.append({"kind": "reasoning", "text": text})
+    if run.reasoning_started_mono is None:
+        run.reasoning_started_mono = time.monotonic()
+
+
+def timeline_close_reasoning(run: "GenerationRun") -> None:
+    """收起进行中的思考段：补上耗时，下一段思考重新计时。"""
+    started = run.reasoning_started_mono
+    if started is None:
+        return
+    run.reasoning_started_mono = None
+    if run.timeline and run.timeline[-1].get("kind") == "reasoning":
+        run.timeline[-1]["durationMs"] = int((time.monotonic() - started) * 1000)
+
+
+def finalize_timeline(run: "GenerationRun", status: str) -> None:
+    """运行结束时的轨迹收尾：不留“进行中”，与前端展示口径一致。
+
+    思考段补耗时；仍在执行的工具与压缩卡片按取消 / 状态未知收尾（与前端
+    settleGeneration 同一规则），等待决议的审批标记为已取消。
+    """
+    timeline_close_reasoning(run)
+    fallback = "cancelled" if status == STATUS_CANCELLED else "unknown"
+    for item in run.timeline:
+        kind = item.get("kind")
+        if kind == "tool" and item.get("status") == "running":
+            item["status"] = fallback
+        elif kind == "compact" and item.get("status") == "running":
+            item["status"] = fallback
+        elif kind == "approval" and item.get("status") == "pending":
+            item["status"] = "cancelled"
+
+
+def timeline_for_storage(run: "GenerationRun") -> str | None:
+    """把展示轨迹序列化入库；纯文字回复（没有过程轨迹）返回 None。
+
+    思考正文按展示上限截断，整段 JSON 再脱敏一次，保证入库内容与下发
+    内容是同一口径。轨迹只作展示，不参与模型上下文。
+    """
+    if not any(item.get("kind") != "text" for item in run.timeline):
+        return None
+    items: list[dict[str, Any]] = []
+    for item in run.timeline:
+        stored = dict(item)
+        if stored.get("kind") == "reasoning":
+            text = str(stored.get("text") or "")
+            if len(text) > TIMELINE_REASONING_MAX_LENGTH:
+                stored["text"] = text[:TIMELINE_REASONING_MAX_LENGTH] + "…（已截断）"
+        items.append(stored)
+    return redact(json.dumps(items, ensure_ascii=False), run.api_key)
 
 
 def timeline_update_tool(timeline: list[dict[str, Any]], event: dict[str, Any]) -> None:
@@ -201,6 +328,15 @@ def timeline_update_tool(timeline: list[dict[str, Any]], event: dict[str, Any]) 
     target["durationMs"] = event.get("durationMs")
     target["summary"] = event.get("summary")
     target["result"] = event.get("result")
+
+
+def timeline_update_approval(timeline: list[dict[str, Any]], event: dict[str, Any]) -> None:
+    """用 approval_result 更新时间线上对应的审批卡片（requestId 配对）。"""
+    request_id = event.get("requestId")
+    for item in reversed(timeline):
+        if item.get("kind") == "approval" and item.get("requestId") == request_id:
+            item["status"] = event.get("decision")
+            return
 
 
 def timeline_update_compact(timeline: list[dict[str, Any]], event: dict[str, Any]) -> None:
@@ -266,13 +402,24 @@ class GenerationRun:
     # 会话压缩状态：当前有效摘要与已压缩边界（None 表示尚未压缩）
     session_summary: str = ""
     summary_boundary: int | None = None
+    # 工具执行审批（模块二）：审批档位不为 off 时提供钩子，评测路径始终不审批
+    approval_level: str = "off"
+    # 会话级自主档位覆盖（聊天输入框切换）；空串表示跟随 Agent 配置
+    autonomy_mode: str = ""
+    # 运行级工作区覆盖（阶段化开发 v2）：项目下的会话把项目钉住的目录
+    # 写上会话；空串表示跟随 Agent 配置的工作区
+    workspace_dir: str = ""
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     run_id: str | None = None
+    # 运行开始的墙上时间（epoch 毫秒）：展示“处理中 Xs”用，刷新后仍准确
+    started_at_ms: int = 0
     phase: str = PHASE_THINKING
     content: str = ""
     tool_name: str | None = None
     # 展示时间线：正文段与工具卡片段按事件顺序交错，重连快照用它恢复
     timeline: list[dict[str, Any]] = field(default_factory=list)
+    # 当前思考段的开始时刻（monotonic）；None 表示没有进行中的思考段
+    reasoning_started_mono: float | None = None
     subscribers: list[asyncio.Queue] = field(default_factory=list)
     had_subscribers: bool = False
     finished: bool = False
@@ -320,6 +467,9 @@ class GenerationManager:
         model_id: int | None = None,
         model_name: str = "",
         model_identifier: str = "",
+        approval_level: str = "off",
+        autonomy_mode: str = "",
+        workspace_dir: str = "",
     ) -> None:
         """启动一次后台运行；同一会话同时只允许一个运行。
 
@@ -343,6 +493,10 @@ class GenerationManager:
             model_identifier=model_identifier,
             session_summary=session_summary,
             summary_boundary=summary_boundary,
+            approval_level=approval_level,
+            autonomy_mode=autonomy_mode,
+            workspace_dir=workspace_dir,
+            started_at_ms=int(time.time() * 1000),
         )
         recorder = RunRecorder(
             session_factory,
@@ -365,7 +519,11 @@ class GenerationManager:
         self._last_outcomes.pop(session_id, None)
 
     async def stop(self, session_id: int) -> dict[str, Any] | None:
-        """请求停止运行并等待收尾，返回终态事件（无任务时 None）。"""
+        """请求停止运行并等待收尾，返回终态事件（无任务时 None）。
+
+        挂起的审批请求一并取消：Runtime 的等待被任务取消打断后走统一
+        收尾路径；这里在任务结束后再兜底清理一次，保证注册表不留悬挂项。
+        """
         run = self._runs.get(session_id)
         if run is None or run.task is None:
             return None
@@ -373,6 +531,7 @@ class GenerationManager:
         run.cancel_event.set()
         run.task.cancel()
         await asyncio.gather(run.task, return_exceptions=True)
+        approval_registry.cancel_for_session(session_id)
         return self._last_outcomes.get(session_id)
 
     async def close(self) -> None:
@@ -382,6 +541,8 @@ class GenerationManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for session_id in list(self._runs):
+            approval_registry.cancel_for_session(session_id)
 
     # ---- 订阅 ----
 
@@ -424,6 +585,8 @@ class GenerationManager:
                 run.recorder.finish(event)
             except Exception:
                 logger.exception("保存运行终态失败 session_id=%s run_id=%s", run.session_id, run.run_id)
+        # 运行结束的兜底清理：仍有挂起的审批请求（如异常路径遗漏）标记取消
+        approval_registry.cancel_for_run(run.run_id)
         self._last_outcomes[run.session_id] = event
         self._broadcast(run, event)
         self._runs.pop(run.session_id, None)
@@ -436,11 +599,17 @@ class GenerationManager:
             "content": run.content,
             "agentName": run.agent_name,
             "toolName": run.tool_name,
+            # 运行开始时间（epoch 毫秒）：前端展示“处理中 Xs”，刷新后仍准确
+            "startedAt": run.started_at_ms,
             "timeline": [dict(item) for item in run.timeline],
+            # 当前仍在等待决议的审批请求：刷新 / 重新打开页面后恢复审批卡片
+            "pendingApprovals": [
+                approval.payload() for approval in approval_registry.pending_for_run(run.run_id)
+            ],
         }
 
     def _save_assistant_message(self, run: GenerationRun, status: str) -> ChatMessage:
-        """任务自己的短数据库会话：保存回复正文并更新会话时间。"""
+        """任务自己的短数据库会话：保存回复正文与过程轨迹并更新会话时间。"""
         db: Session = run.session_factory()
         try:
             content = redact(run.content, run.api_key)
@@ -453,6 +622,8 @@ class GenerationManager:
                 status=status,
                 seq=next_seq(db, run.session_id),
                 created_at=utcnow(),
+                # 轨迹随消息入库：刷新页面后思考行与工具卡片照常恢复
+                timeline_json=timeline_for_storage(run),
             )
             db.add(message)
             session = db.get(ChatSession, run.session_id)
@@ -475,6 +646,9 @@ class GenerationManager:
         event_type = event.get("type")
         if event_type != RUN_END and run.recorder is not None:
             run.recorder.record_event(event)
+        # 思考段在第一个非思考事件到达时收起并补耗时（正文/工具/压缩等）
+        if event_type != REASONING_DELTA:
+            timeline_close_reasoning(run)
         if event_type == RUN_START:
             run.run_id = event.get("runId")
             self._broadcast(run, event)
@@ -484,6 +658,10 @@ class GenerationManager:
             timeline_append_text(run.timeline, event.get("text", ""))
             if run.phase != PHASE_GENERATING:
                 run.phase = PHASE_GENERATING
+            self._broadcast(run, event)
+            return
+        if event_type == REASONING_DELTA:
+            timeline_append_reasoning(run, event.get("text", ""))
             self._broadcast(run, event)
             return
         if event_type == TOOL_CALL_START:
@@ -525,6 +703,29 @@ class GenerationManager:
             run.timeline.append(timeline_compact_item(event))
             self._broadcast(run, event)
             return
+        if event_type == APPROVAL_REQUEST:
+            # 审批卡片进入时间线；等待决议期间阶段标记为 approval
+            run.phase = PHASE_APPROVAL
+            run.timeline.append(
+                {
+                    "kind": "approval",
+                    "requestId": event.get("requestId"),
+                    "callId": event.get("callId"),
+                    "toolName": event.get("toolName"),
+                    "toolType": event.get("toolType"),
+                    "displayName": event.get("displayName"),
+                    "serverName": event.get("serverName"),
+                    "arguments": event.get("arguments"),
+                    "status": "pending",
+                }
+            )
+            self._broadcast(run, event)
+            return
+        if event_type == APPROVAL_RESULT:
+            run.phase = PHASE_GENERATING if run.content.strip() else PHASE_THINKING
+            timeline_update_approval(run.timeline, event)
+            self._broadcast(run, event)
+            return
         if event_type == RUN_END:
             self._handle_run_end(run, event)
             return
@@ -532,13 +733,27 @@ class GenerationManager:
         self._broadcast(run, event)
 
     def _handle_run_end(self, run: GenerationRun, event: dict[str, Any]) -> None:
-        """运行结束：按状态保存回复正文，把已保存消息附加到终态事件。"""
+        """运行结束：按状态保存回复正文，把已保存消息附加到终态事件。
+
+        阶段收尾（stage_complete）：回复按完成保存，把 finish_stage 的
+        阶段摘要写上会话（awaiting_acceptance）等待用户验收，并推进所属
+        阶段项目的进度（阶段化开发 v2）。
+        计划上报（plan_submitted）：创建（或覆盖）阶段项目，把会话挂为
+        规划会话，等待用户确认开始。
+        汇总会话完成：项目标记 completed，整个阶段流程收尾。
+        """
         status = event.get("status")
         final_event = dict(event)
         final_event.setdefault("message", None)
+        # 入库前先收尾轨迹：不留“执行中”的卡片，思考段补上耗时
+        finalize_timeline(run, str(status or ""))
 
         if run.content.strip():
-            db_status = STATUS_COMPLETED if status == STATUS_COMPLETED else STATUS_INCOMPLETE
+            db_status = (
+                STATUS_COMPLETED
+                if status in (STATUS_COMPLETED, STATUS_STAGE_COMPLETE, STATUS_PLAN_SUBMITTED)
+                else STATUS_INCOMPLETE
+            )
             try:
                 message = self._save_assistant_message(run, db_status)
                 final_event["message"] = message_event_payload(message)
@@ -553,7 +768,169 @@ class GenerationManager:
                     ),
                     "hint": "内容仅在当前页面可见，刷新后会丢失",
                 }
+        if status == STATUS_STAGE_COMPLETE:
+            try:
+                self._mark_stage_awaiting(run, event.get("stage"))
+            except Exception:
+                logger.exception("保存阶段验收状态失败 session_id=%s", run.session_id)
+            try:
+                self._mark_project_stage_done(run)
+            except Exception:
+                logger.exception("推进阶段项目进度失败 session_id=%s", run.session_id)
+        elif status == STATUS_PLAN_SUBMITTED:
+            try:
+                self._handle_plan_submitted(run, event.get("plan"))
+            except Exception:
+                logger.exception("创建阶段项目失败 session_id=%s", run.session_id)
+        if status in (STATUS_COMPLETED, STATUS_CANCELLED, STATUS_ERROR, STATUS_ROUNDS_EXHAUSTED):
+            try:
+                self._settle_project_summary(run, str(status or ""))
+            except Exception:
+                logger.exception("收尾项目汇总状态失败 session_id=%s", run.session_id)
         self._finish(run, final_event)
+
+    def _mark_stage_awaiting(self, run: GenerationRun, stage: Any) -> None:
+        """阶段收尾：把验收状态与阶段摘要写上会话（幂等，短事务）。"""
+        if not isinstance(stage, dict):
+            stage = {}
+        summary: dict[str, str] = {}
+        for key in ("stageName", "summary", "handoffPath", "nextStep"):
+            value = stage.get(key)
+            if isinstance(value, str) and value.strip():
+                summary[key] = value.strip()
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None:
+                return
+            session.awaiting_acceptance = True
+            session.stage_summary_json = (
+                redact(json.dumps(summary, ensure_ascii=False), run.api_key) if summary else None
+            )
+            session.updated_at = utcnow()
+            db.commit()
+        finally:
+            db.close()
+
+    # ---- 阶段项目状态机（阶段化开发 v2） ----
+
+    def _handle_plan_submitted(self, run: GenerationRun, plan: Any) -> None:
+        """plan_submitted：创建（或覆盖）阶段项目并将会话挂为规划会话。
+
+        项目钉住的工作区取会话上的目录；规划会话没有时回落 Agent 配置的
+        工作区（与本次运行实际使用的一致），后续阶段会话一律继承该目录。
+        """
+        if not isinstance(plan, dict):
+            return
+        stages_raw = plan.get("stages")
+        if not isinstance(stages_raw, list):
+            return
+        plan_items: list[dict[str, str]] = []
+        for item in stages_raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            goal = item.get("goal")
+            if isinstance(name, str) and name.strip() and isinstance(goal, str) and goal.strip():
+                plan_items.append({"name": name.strip(), "goal": goal.strip(), "status": "pending"})
+        if not plan_items:
+            return
+        title = plan.get("title")
+        title = title.strip() if isinstance(title, str) and title.strip() else "开发项目"
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None:
+                return
+            workspace = (session.workspace_dir or "").strip()
+            if not workspace and run.agent_id is not None:
+                agent = db.get(Agent, run.agent_id)
+                workspace = (agent.workspace_dir or "").strip() if agent is not None else ""
+            now = utcnow()
+            project = db.get(StageProject, session.project_id) if session.project_id else None
+            if project is None:
+                project = StageProject(
+                    title=title,
+                    agent_id=run.agent_id,
+                    agent_name=run.agent_name,
+                    workspace_dir=workspace,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(project)
+                db.flush()
+            # 同一规划会话再次提交计划：覆盖旧计划并回到待开始
+            project.title = title[:128]
+            project.plan_json = json.dumps(plan_items, ensure_ascii=False)
+            project.current_stage = 0
+            project.status = PROJECT_AWAITING_START
+            project.updated_at = now
+            session.project_id = project.id
+            session.project_role = PROJECT_ROLE_PLAN
+            session.stage_index = None
+            session.updated_at = now
+            db.commit()
+        finally:
+            db.close()
+
+    def _mark_project_stage_done(self, run: GenerationRun) -> None:
+        """stage_complete：把所属项目里本阶段标记为 done 并推进状态。
+
+        还有未完成阶段时进入 in_progress（current_stage 指向下一个待办
+        阶段）；全部完成时转入 awaiting_summary，等待用户发起汇总。
+        """
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None or session.project_id is None or session.stage_index is None:
+                return
+            project = db.get(StageProject, session.project_id)
+            if project is None:
+                return
+            try:
+                plan = json.loads(project.plan_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                return
+            if not isinstance(plan, list):
+                return
+            stage_index = session.stage_index
+            if isinstance(stage_index, int) and 1 <= stage_index <= len(plan):
+                plan[stage_index - 1]["status"] = "done"
+            next_index = next(
+                (i + 1 for i, item in enumerate(plan) if isinstance(item, dict) and item.get("status") != "done"),
+                0,
+            )
+            if next_index == 0:
+                project.status = PROJECT_AWAITING_SUMMARY
+                project.current_stage = len(plan)
+            else:
+                project.status = PROJECT_IN_PROGRESS
+                project.current_stage = next_index
+            project.plan_json = json.dumps(plan, ensure_ascii=False)
+            project.updated_at = utcnow()
+            db.commit()
+        finally:
+            db.close()
+
+    def _settle_project_summary(self, run: GenerationRun, status: str) -> None:
+        """汇总会话运行收尾：completed 标记项目完成；失败/取消回退到
+        awaiting_summary 允许重试。其他角色的会话不受影响。"""
+        db: Session = run.session_factory()
+        try:
+            session = db.get(ChatSession, run.session_id)
+            if session is None or session.project_role != PROJECT_ROLE_SUMMARY or session.project_id is None:
+                return
+            project = db.get(StageProject, session.project_id)
+            if project is None:
+                return
+            if status == STATUS_COMPLETED:
+                project.status = PROJECT_COMPLETED
+            elif project.status == PROJECT_SUMMARIZING:
+                project.status = PROJECT_AWAITING_SUMMARY
+            project.updated_at = utcnow()
+            db.commit()
+        finally:
+            db.close()
 
     def _persist_summary(self, run: GenerationRun, summary: str, boundary: int) -> None:
         """压缩成功的持久化回调：新摘要与边界一致写入会话（失败抛异常）。
@@ -572,6 +949,19 @@ class GenerationManager:
         finally:
             db.close()
 
+    async def _wait_approval(self, run: GenerationRun, info: dict[str, Any]) -> str:
+        """审批钩子：登记挂起请求并等待用户决议，返回 approved / rejected。
+
+        等待被取消（用户停止生成会取消等待；等待超时由 Runtime 控制）
+        时，把挂起请求标记为取消并向上传播，注册表与后台任务都不悬挂。
+        """
+        approval = approval_registry.create(run.session_id, run.run_id, info)
+        try:
+            return await approval.future
+        except asyncio.CancelledError:
+            approval_registry.settle(approval.request_id, DECISION_CANCELLED)
+            raise
+
     async def _execute(self, run: GenerationRun) -> None:
         """后台任务：调用统一 Agent Runtime 执行一次运行。"""
         try:
@@ -580,6 +970,17 @@ class GenerationManager:
                 secret_box=run.secret_box,
                 skills_dir=run.skills_dir,
             )
+            # 审批钩子仅当审批档位不为 off 时提供；评测路径不经过这里，
+            # RuntimeRequest.approval 为 None，工具调用一律自动执行
+            approval_hooks: ApprovalHooks | None = None
+            if run.approval_level and run.approval_level != "off":
+                approval_hooks = ApprovalHooks(
+                    timeout_seconds=settings.approval_timeout_seconds,
+                    open_request=lambda info: self._wait_approval(run, info),
+                    settle_request=lambda request_id, decision: approval_registry.settle(
+                        request_id, decision
+                    ),
+                )
             request = RuntimeRequest(
                 agent_id=run.agent_id,
                 user_input=run.user_input,
@@ -589,6 +990,11 @@ class GenerationManager:
                 persist_summary=lambda summary, boundary: self._persist_summary(
                     run, summary, boundary
                 ),
+                approval=approval_hooks,
+                workspace_dir=run.workspace_dir,
+                model_id=run.model_id,
+                approval_level=run.approval_level,
+                autonomy_mode=run.autonomy_mode,
             )
             await runtime.run(
                 request,

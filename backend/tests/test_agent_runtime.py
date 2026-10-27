@@ -104,6 +104,12 @@ def seed_agent(
     compact_threshold: int = 80,
     compact_keep_rounds: int = 4,
     compact_summary_tokens: int = 1000,
+    workspace_dir: str = "",
+    approval_level: str = "off",
+    # 测试默认高度自主：不带阶段协议提示词，便于断言纯系统提示词；
+    # 阶段确认模式由专门的测试构造
+    autonomy_mode: str = "autonomous",
+    shell_whitelist: str = "",
 ) -> int:
     seed_tools(factory)
     db = factory()
@@ -134,6 +140,10 @@ def seed_agent(
             compact_threshold=compact_threshold,
             compact_keep_rounds=compact_keep_rounds,
             compact_summary_tokens=compact_summary_tokens,
+            workspace_dir=workspace_dir,
+            approval_level=approval_level,
+            autonomy_mode=autonomy_mode,
+            shell_whitelist=shell_whitelist,
             is_default=True,
             created_at=now,
             updated_at=now,
@@ -1102,3 +1112,73 @@ class TestToolDisplayEvents:
         assert events[-1]["type"] == "run_end"
         assert events[-1]["status"] == STATUS_CANCELLED
         assert SleepingSession.instances[0].closed is True
+
+
+# ---- Agent 工作区（模块一）----
+
+
+class TestAgentWorkspace:
+    def test_builtin_tool_runs_in_agent_workspace(
+        self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        agent_ws = tmp_path / "agent-code-ws"
+        agent_ws.mkdir()
+        agent_id = seed_agent(factory, box, tool_keys=("builtin_file",), workspace_dir=str(agent_ws))
+        transport = ScriptedTransport(
+            [
+                [
+                    tool_call_chunk(
+                        0,
+                        "call_1",
+                        "builtin_file",
+                        '{"action": "write", "path": "note.txt", "content": "hi"}',
+                    ),
+                    finish_chunk("tool_calls"),
+                    DONE_CHUNK,
+                ],
+                [text_chunk("已写入"), DONE_CHUNK],
+            ]
+        )
+        install(monkeypatch, transport)
+
+        result, events = run_runtime(runtime, agent_id)
+
+        assert result.status == STATUS_COMPLETED
+        # 文件落在 Agent 配置的工作区，而不是全局默认目录
+        assert (agent_ws / "note.txt").read_text(encoding="utf-8") == "hi"
+        from app.core.config import settings
+
+        assert not (settings.tool_workspace_dir / "note.txt").exists()
+        tool_end = next(e for e in events if e["type"] == "tool_call_end")
+        assert tool_end["status"] == "success"
+
+    def test_builtin_tool_falls_back_to_default_workspace(
+        self, runtime: AgentRuntime, factory, box, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        default_ws = tmp_path / "default-ws"
+        default_ws.mkdir()
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "tool_workspace_dir", default_ws)
+        agent_id = seed_agent(factory, box, tool_keys=("builtin_file",))  # 未配置工作区
+        transport = ScriptedTransport(
+            [
+                [
+                    tool_call_chunk(
+                        0,
+                        "call_1",
+                        "builtin_file",
+                        '{"action": "write", "path": "note.txt", "content": "hi"}',
+                    ),
+                    finish_chunk("tool_calls"),
+                    DONE_CHUNK,
+                ],
+                [text_chunk("已写入"), DONE_CHUNK],
+            ]
+        )
+        install(monkeypatch, transport)
+
+        result, _ = run_runtime(runtime, agent_id)
+
+        assert result.status == STATUS_COMPLETED
+        assert (default_ws / "note.txt").read_text(encoding="utf-8") == "hi"

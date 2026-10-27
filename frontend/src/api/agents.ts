@@ -22,6 +22,12 @@ export interface AgentBindingRef {
   available: boolean
 }
 
+/** 审批档位（阶段十五）：off 不审批 / standard 高风险动作审批 / strict 全部工具审批。 */
+export type ApprovalLevel = 'off' | 'standard' | 'strict'
+
+/** 自主档位（阶段十五）：stage_confirm 阶段确认（做完即停等人验收）/ autonomous 高度自主。 */
+export type AutonomyMode = 'stage_confirm' | 'autonomous'
+
 /** 一条 Agent 配置；绑定数量按实际保存的绑定统计，含已停用能力。 */
 export interface AgentItem {
   id: number
@@ -30,6 +36,14 @@ export interface AgentItem {
   model: AgentModelInfo | null
   promptVersion: number
   maxRounds: number
+  /** 工作区目录：空串 = 使用全局默认目录；文件工具沙箱与 Shell 工作目录跟随它 */
+  workspaceDir: string
+  /** 审批档位（取代旧布尔开关） */
+  approvalLevel: ApprovalLevel
+  /** 自主档位：决定是否提供 finish_stage 与阶段工作流协议 */
+  autonomyMode: AutonomyMode
+  /** Shell 命令白名单：换行/逗号分隔的命令前缀，命中免审批（黑名单仍生效） */
+  shellWhitelist: string
   /** 上下文压缩配置：长会话超过估算容量时自动整理摘要 */
   autoCompact: boolean
   /** 触发比例（百分比整数 10–95）：估算输入达到可用输入容量的该比例时触发 */
@@ -61,6 +75,10 @@ export interface AgentPayload {
   systemPrompt: string
   modelId: number
   maxRounds: number
+  workspaceDir: string
+  approvalLevel: ApprovalLevel
+  autonomyMode: AutonomyMode
+  shellWhitelist: string
   autoCompact: boolean
   compactThreshold: number
   compactKeepRounds: number

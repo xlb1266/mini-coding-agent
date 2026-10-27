@@ -110,25 +110,32 @@ class TestShell:
         assert result.error_type == ERROR_INVALID_PARAMS
         assert "command" in result.fields
 
-    def test_timeout_range_enforced(self) -> None:
+    def test_timeout_range_clamped(self) -> None:
+        # 超出上限按上限截断、过小按 1 秒处理，不再报参数错误（阶段十四）
         for timeout in (0, -1, settings.tool_shell_timeout_max_seconds + 1):
             result = result_for("builtin_shell", {"command": "echo hi", "timeout": timeout})
 
-            assert result.error_type == ERROR_INVALID_PARAMS
-            assert "timeout" in result.fields
+            assert result.ok is True
+            assert result.data["timedOut"] is False
 
     def test_timeout_terminates_command(self) -> None:
         result = result_for("builtin_shell", {"command": 'python -c "import time; time.sleep(5)"', "timeout": 1})
 
-        assert result.ok is False
-        assert result.error_type == ERROR_TIMEOUT
+        assert result.ok is True
+        assert result.data["timedOut"] is True
+        assert result.data["exitCode"] is None
+        assert result.data["success"] is False
+        assert "已被整树终止" in result.data["message"]
 
-    def test_output_truncated(self) -> None:
+    def test_output_truncated(self, workspace: Path) -> None:
         result = result_for("builtin_shell", {"command": "python -c \"print('x' * 50000)\""})
 
         assert result.ok is True
         assert result.data["truncated"] is True
-        assert "已截断" in result.data["stdout"]
+        assert "全量输出已落盘" in result.data["stdout"]
+        persisted = result.data.get("persistedOutputPath")
+        assert persisted is not None
+        assert Path(persisted).read_text(encoding="utf-8").startswith("x")
 
     def test_blocked_command_never_runs(self) -> None:
         result = result_for("builtin_shell", {"command": "rm -rf /"})

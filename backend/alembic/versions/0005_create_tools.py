@@ -19,6 +19,10 @@ down_revision: Union[str, None] = "0004"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+# 本迁移落库时注册表里已有的三个工具；后续新增的内置工具由各自的迁移插入，
+# 这里固定 key，避免注册表扩充后重放本迁移时重复插入
+ORIGINAL_TOOL_KEYS = ("builtin_current_time", "builtin_shell", "builtin_file")
+
 
 def upgrade() -> None:
     op.create_table(
@@ -45,7 +49,8 @@ def upgrade() -> None:
         sa.column("created_at"),
         sa.column("updated_at"),
     )
-    op.bulk_insert(tools_table, builtin_tool_rows())
+    rows = [row for row in builtin_tool_rows() if row["key"] in ORIGINAL_TOOL_KEYS]
+    op.bulk_insert(tools_table, rows)
 
 
 def downgrade() -> None:

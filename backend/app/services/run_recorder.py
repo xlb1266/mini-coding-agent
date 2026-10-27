@@ -40,6 +40,7 @@ from app.db.models.run_record import (
 )
 from app.services.agent_runtime import (
     RUN_END,
+    REASONING_DELTA,
     TEXT_DELTA,
     TOOL_CALL_END,
     sanitize_display,
@@ -47,9 +48,12 @@ from app.services.agent_runtime import (
 
 logger = logging.getLogger(__name__)
 
-# Runtime 终态 → Run 状态（rounds_exhausted 属于部分完成，不是失败）
+# Runtime 终态 → Run 状态（rounds_exhausted 属于部分完成，不是失败；
+# stage_complete 是阶段确认模式的正常收尾，同 completed）
 RUNTIME_STATUS_TO_RUN: dict[str, str] = {
     "completed": RUN_STATUS_COMPLETED,
+    "stage_complete": RUN_STATUS_COMPLETED,
+    "plan_submitted": RUN_STATUS_COMPLETED,
     "rounds_exhausted": RUN_STATUS_PARTIAL,
     "cancelled": RUN_STATUS_CANCELLED,
     "error": RUN_STATUS_FAILED,
@@ -140,9 +144,9 @@ class RunRecorder:
     # ---- 事件 ----
 
     def record_event(self, event: dict[str, Any]) -> None:
-        """持久化一个运行事件（text_delta 除外）；重复 seq 直接跳过。"""
+        """持久化一个运行事件（正文/思考增量除外）；重复 seq 直接跳过。"""
         event_type = event.get("type")
-        if event_type == TEXT_DELTA or not self._enabled:
+        if event_type in (TEXT_DELTA, REASONING_DELTA) or not self._enabled:
             return
         seq = event.get("seq")
         if not isinstance(seq, int):
