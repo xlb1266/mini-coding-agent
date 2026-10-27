@@ -29,3 +29,6 @@ backend/secret.key
 
 # ZCode 工具目录（会话计划、工作流草稿等，非项目代码）
 .zcode/
+
+# 本地开发笔记，不参与版本控制
+docs/

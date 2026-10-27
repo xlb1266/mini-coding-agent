@@ -1,8 +1,8 @@
 # mini-coding-agent
 
-本地优先的 coding agent 工作台，由 mini-agent 底座（`main` 的 `869fd50`）派生的独立项目。当前继承底座的八个模块：聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测，后续在此基础上特化 coding agent 能力。
+本地优先的 coding agent 工作台，包含聊天、Agent 管理、模型管理、工具管理、MCP 管理、Skills 管理、运行记录、Agent 评测八个模块，并在此之上特化 coding agent 能力：Agent 绑定本机工作区（文件沙箱与 Shell 执行目录跟随）、内置文件编辑/列目录/搜索工具、Shell 后台任务托管与阻塞保险丝、三档执行治理（审批档位 + 阶段化开发工作流）、聊天轨迹展示与 LLM Judge 评测回归对比。
 
-当前进度：阶段一（系统初始化）、阶段二（模型管理）、阶段三（工具管理）、阶段四（Skills 管理）、阶段五（MCP 管理）、阶段六（Agent 管理）、阶段七（聊天页面）、阶段八（统一 Agent Runtime）、阶段九（工具执行过程展示）、阶段十（上下文容量管理与自动压缩）、阶段十一（运行记录与可观察性）与阶段十二（Agent 评测）已完成。详见 [docs/phase-1.md](docs/phase-1.md) 至 [docs/phase-12.md](docs/phase-12.md)。
+项目按 16 个阶段逐步演进（系统初始化 → 八个管理模块 → 统一 Agent Runtime → 上下文压缩 → 运行记录 → 评测 → coding 特化与执行治理），完整开发轨迹见仓库提交历史。
 
 ## 技术栈
 
@@ -18,7 +18,6 @@
 ./
   frontend/    前端源码（frontend/src）
   backend/     后端源码（backend/app）、Alembic 迁移（backend/alembic）
-  docs/        阶段文档
   AGENTS.md    开发约定（技术栈、命令、设计变量、修改后检查）
 ```
 
@@ -29,28 +28,28 @@
 
 ## 快速开始
 
-### 1. 启动后端（端口 8001，只监听本机）
+### 1. 启动后端（端口 8000，只监听本机）
 
 ```bash
 cd backend
 uv sync                                          # 按 uv.lock 安装依赖到 .venv
 uv run alembic upgrade head                      # 建库并应用迁移（生成 backend/mini_agent.db）
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 命令含义：`uv run` 在项目虚拟环境中执行命令；`uvicorn app.main:app` 指启动 `app/main.py` 里的 FastAPI 实例；`--host 127.0.0.1` 限制只监听本机；`--reload` 让代码修改后自动重启。
 
-验证：访问 http://127.0.0.1:8001/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
+验证：访问 http://127.0.0.1:8000/api/health ，应返回 `{"status":"ok","database":"ok",...}`。
 
-### 2. 启动前端（端口 5174）
+### 2. 启动前端（默认端口 5173）
 
 ```bash
 cd frontend
 npm install                                      # 安装依赖
-npm run dev -- --port 5174                                 # 启动 Vite 开发服务
+npm run dev                                                                     # 启动 Vite 开发服务
 ```
 
-打开 http://localhost:5174 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8001 端口的后端，业务代码不写死后端地址。
+打开 http://localhost:5173 。前端所有请求都使用相对路径 `/api`，由 Vite 开发服务代理转发到本机 8000 端口的后端，业务代码不写死后端地址。
 
 ## 测试
 
